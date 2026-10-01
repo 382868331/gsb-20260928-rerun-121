@@ -31,6 +31,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/admin/v1/releases", s.handlePublish)
+	mux.HandleFunc("/admin/v1/rollback", s.handleRollback)
 	mux.HandleFunc("/api/v1/releases/latest", s.handleLatest)
 	mux.HandleFunc("/api/v1/releases/", s.handleGetRelease)
 	mux.HandleFunc("/api/v1/register", s.handleRegister)
@@ -68,13 +69,32 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "content 必填（整份配置）")
 		return
 	}
-	rel, err := s.store.Publish(req.Content)
+	rel, err := s.store.Publish(req.Content, req.Batches)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	log.Printf("[server] 发布新版本 v%d checksum=%s", rel.Version, rel.Checksum)
+	log.Printf("[server] 发布新版本 v%d checksum=%s 批次=%d", rel.Version, rel.Checksum, len(req.Batches))
 	writeJSON(w, http.StatusCreated, rel)
+}
+
+// POST /admin/v1/rollback 发布明确的回退目标版本。
+func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "仅支持 POST")
+		return
+	}
+	var req protocol.RollbackRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体无效: "+err.Error())
+		return
+	}
+	if err := s.store.Rollback(req.Version); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	log.Printf("[server] 回退目标版本 -> v%d", req.Version)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "rolled back"})
 }
 
 func (s *Server) handleLatest(w http.ResponseWriter, r *http.Request) {
@@ -102,7 +122,7 @@ func (s *Server) handleGetRelease(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, rel)
 }
 
-// POST /api/v1/register 注册/心跳对账：上报实际版本，拿回最新全量。
+// POST /api/v1/register 注册/心跳对账：上报实际版本，拿回目标版本全量。
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "仅支持 POST")
@@ -117,7 +137,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "client_id 必填")
 		return
 	}
-	latest, has, err := s.store.Touch(req.ClientID, req.ActiveVersion)
+	target, has, err := s.store.Touch(req.ClientID, req.ActiveVersion)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -125,14 +145,14 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	s.markOnline(req.ClientID)
 	resp := protocol.ReconcileResponse{TargetVersion: 0}
 	if has {
-		rel := latest
+		rel := target
 		resp.Latest = &rel
-		resp.TargetVersion = latest.Version
+		resp.TargetVersion = target.Version
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// POST /api/v1/ack 客户端确认（downloaded/applied/failed）。
+// POST /api/v1/ack 客户端确认（downloaded/verified/applied/failed）。
 func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "仅支持 POST")
