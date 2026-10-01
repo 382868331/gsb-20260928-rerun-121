@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"configdist/internal/client"
@@ -41,59 +43,84 @@ func main() {
 		}
 		return ""
 	}
-	c1 := newClient(base, "client-1", nil)
-	c2 := newClient(base, "client-2", failV2)
-	c3 := newClient(base, "client-3", nil)
-	clients := map[string]*client.Client{"client-1": c1, "client-2": c2, "client-3": c3}
+	ackLost := func(version int, kind string) bool {
+		return version == 2 && kind == protocol.AckApplied
+	}
+	offline := newClient(base, "client-offline", nil)
+	applyFail := newClient(base, "client-apply-fail", failV2)
+	ackLostClient := newClient(base, "client-ack-lost", nil)
+	ackLostClient.SetAckHook(ackLost)
+	clients := map[string]*client.Client{
+		"client-offline":    offline,
+		"client-apply-fail": applyFail,
+		"client-ack-lost":   ackLostClient,
+	}
 	for _, c := range clients {
-		c.Start(500 * time.Millisecond)
+		c.Start(2 * time.Second)
 	}
 	defer func() {
 		for _, c := range clients {
 			c.Stop()
 		}
 	}()
-	time.Sleep(600 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 
 	publish(map[string]interface{}{"app": "demo", "port": 8080, "feature_x": false})
 	waitFor(3*time.Second, func() bool { return allActive(clients, 1) })
-	showStatus("发布 v1 后")
+	showStatus("发布 v1 后，三个客户端均实际生效 v1")
 
-	publish(map[string]interface{}{"app": "demo", "port": 80, "feature_x": true})
-	time.Sleep(1500 * time.Millisecond)
-	showStatus("发布 v2 后（client-2 应用失败，保留 v1 与失败原因，仍 pending）")
-	fmt.Printf("    client-2 磁盘上实际生效文件: %s\n\n", readActive(filepath.Join(base, "client-2", "active.json")))
+	offline.SetPaused(true)
+	publishBatch(map[string]interface{}{"app": "demo", "port": 80, "feature_x": true}, []string{"client-apply-fail", "client-ack-lost"})
+	time.Sleep(2500 * time.Millisecond)
+	showStatus("v2 首批：应用失败保留 v1，确认丢失实际为 v2，离线端仍等待")
+	fmt.Printf("    应用失败端磁盘文件: %s\n", readActive(filepath.Join(base, "client-apply-fail", "active.json")))
+	fmt.Printf("    确认丢失端磁盘文件: %s\n\n", readActive(filepath.Join(base, "client-ack-lost", "active.json")))
 
-	fmt.Println("[4] 幂等性检查：对已 applied 的 client-1 重放 downloaded / failed / 旧版本确认")
-	sendAck(protocol.AckRequest{ClientID: "client-1", Version: 2, Kind: protocol.AckDownloaded})
-	sendAck(protocol.AckRequest{ClientID: "client-1", Version: 2, Kind: protocol.AckFailed, Reason: "迟到的失败"})
-	sendAck(protocol.AckRequest{ClientID: "client-1", Version: 1, Kind: protocol.AckDownloaded})
-	time.Sleep(300 * time.Millisecond)
-	showStatus("重放确认后（client-1 应保持 applied，不回退）")
-	fmt.Println()
-
-	fmt.Println("[5] 重启服务端（同一持久化目录，构造全新实例）")
-	currentServer = startServer(serverDir)
-	fmt.Println("    新服务端已起:", currentServer.baseURL, "（版本与客户端状态从 state.json 恢复）")
-	for _, c := range clients {
-		c.SetServerURL(currentServer.baseURL)
-		c.SetHTTPClient(currentServer.httpc)
+	fmt.Println("[4] 首批失败后尝试推进离线客户端所在后续批次")
+	if promoteBatch(2, []string{"client-offline"}) {
+		log.Fatal("应用失败后不应允许后续批次放量")
 	}
-	time.Sleep(1200 * time.Millisecond)
-	showStatus("重启后心跳对账（client-1/3 实际 v2，client-2 实际 v1）")
+	showStatus("推进被拒绝，后续批次保持等待")
 	fmt.Println()
 
-	fmt.Println("[6] client-3 短暂断连，期间发布 v3；恢复后直接取最新完整版本")
-	c3.SetPaused(true)
-	publish(map[string]interface{}{"app": "demo", "port": 9090, "feature_x": true, "feature_y": "on"})
-	time.Sleep(1200 * time.Millisecond)
-	fmt.Println("    断连中的 client-3 错过 v3；恢复连接。client-2 跳过未应用的 v2 直达 v3。")
-	c3.SetPaused(false)
-	waitFor(4*time.Second, func() bool { return c1.ActiveVersion() == 3 && c3.ActiveVersion() == 3 })
-	waitFor(4*time.Second, func() bool { return c2.ActiveVersion() == 3 })
-	showStatus("断连恢复 + client-2 跳过 v2 直接应用 v3 完整版本后")
+	fmt.Println("[5] 停止客户端并重启服务端/客户端，按磁盘实际生效版本对账")
+	for _, c := range clients {
+		c.Stop()
+	}
+	currentServer = startServer(serverDir)
+	offline = newClient(base, "client-offline", nil)
+	offline.SetPaused(true)
+	applyFail = newClient(base, "client-apply-fail", failV2)
+	ackLostClient = newClient(base, "client-ack-lost", nil)
+	ackLostClient.SetAckHook(ackLost)
+	clients = map[string]*client.Client{
+		"client-offline":    offline,
+		"client-apply-fail": applyFail,
+		"client-ack-lost":   ackLostClient,
+	}
+	offline.SyncOnce()
+	applyFail.SyncOnce()
+	ackLostClient.SyncOnce()
+	showStatus("重启后心跳对账：下载/验证状态没有被误认为 applied")
+	fmt.Println()
 
-	fmt.Println("== 演示完成：可靠整份切换 / 失败保留原版 / 重启与断连对账 均符合预期 ==")
+	fmt.Println("[6] 显式回退到 v1；不新增版本，也不覆盖 v2 的失败历史")
+	rollback(1)
+	time.Sleep(1200 * time.Millisecond)
+	for _, c := range clients {
+		c.Start(500 * time.Millisecond)
+	}
+	time.Sleep(300 * time.Millisecond)
+	offline.SetPaused(false)
+	waitFor(3*time.Second, func() bool {
+		return applyFail.ActiveVersion() == 1 && ackLostClient.ActiveVersion() == 1 && offline.ActiveVersion() == 1
+	})
+	if sendAckOK(protocol.AckRequest{ClientID: "client-ack-lost", Version: 2, Kind: protocol.AckApplied}) {
+		log.Fatal("回退后迟到的 v2 applied 不应被接受")
+	}
+	showStatus("回退对账后：全部实际为 v1，旧 v2 迟到确认不能改成新版本完成")
+
+	fmt.Println("== 演示完成：分批门控 / 三阶段确认 / 失败停批 / 回退保史 / 重启对账 均符合预期 ==")
 }
 
 func startServer(dir string) *serverInstance {
@@ -114,7 +141,12 @@ func newClient(base, id string, hook client.FailHook) *client.Client {
 }
 
 func publish(content map[string]interface{}) {
-	b, _ := json.Marshal(protocol.PublishRequest{Content: content})
+	publishBatch(content, nil)
+}
+
+func publishBatch(content map[string]interface{}, batch []string) {
+	req := protocol.PublishRequest{Content: content, BatchClientIDs: batch}
+	b, _ := json.Marshal(req)
 	resp, err := currentServer.httpc.Post(currentServer.baseURL+"/admin/v1/releases", "application/json", bytes.NewReader(b))
 	must(err)
 	defer resp.Body.Close()
@@ -126,11 +158,37 @@ func publish(content map[string]interface{}) {
 	fmt.Printf("[publish] 已发布 v%d checksum=%s\n", rel.Version, rel.Checksum)
 }
 
-func sendAck(req protocol.AckRequest) {
+func promoteBatch(version int, batch []string) bool {
+	b, _ := json.Marshal(map[string]interface{}{"version": version, "batch_client_ids": batch})
+	resp, err := currentServer.httpc.Post(currentServer.baseURL+"/admin/v1/batches", "application/json", bytes.NewReader(b))
+	must(err)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Printf("[rollout] 推进后续批次被拒绝: %s\n", strings.TrimSpace(string(body)))
+		return false
+	}
+	return true
+}
+
+func rollback(version int) {
+	b, _ := json.Marshal(protocol.RollbackRequest{Version: version})
+	resp, err := currentServer.httpc.Post(currentServer.baseURL+"/admin/v1/rollback", "application/json", bytes.NewReader(b))
+	must(err)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		log.Fatalf("回退失败: %s", body)
+	}
+	fmt.Printf("[rollback] 当前部署目标已明确设置为 v%d\n", version)
+}
+
+func sendAckOK(req protocol.AckRequest) bool {
 	b, _ := json.Marshal(req)
 	resp, err := currentServer.httpc.Post(currentServer.baseURL+"/api/v1/ack", "application/json", bytes.NewReader(b))
 	must(err)
-	resp.Body.Close()
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }
 
 func showStatus(title string) protocol.StatusResponse {
@@ -140,18 +198,19 @@ func showStatus(title string) protocol.StatusResponse {
 	var st protocol.StatusResponse
 	must(json.NewDecoder(resp.Body).Decode(&st))
 	fmt.Println("---", title)
-	fmt.Printf("    最新版本: v%d\n", st.LatestVersion)
+	fmt.Printf("    最新版本: v%d；部署目标: v%d；模式=%s；停止=%v\n",
+		st.LatestVersion, st.Deployment.TargetVersion, st.Deployment.Mode, st.Deployment.Stopped)
 	for _, c := range st.Clients {
 		online := "offline"
 		if c.Online {
 			online = "online"
 		}
 		errMsg := ""
-		if c.LastError != "" {
-			errMsg = " error=\"" + c.LastError + "\""
+		if len(c.Failures) > 0 {
+			errMsg = fmt.Sprintf(" failures=%d last=\"%s\"", len(c.Failures), c.LastError)
 		}
-		fmt.Printf("    %-9s active=v%d target=v%d state=%-10s %s%s\n",
-			c.ClientID, c.ActiveVersion, c.TargetVersion, c.State, online, errMsg)
+		fmt.Printf("    %-18s active=v%d target=v%d state=%-10s batch=%-5v %s%s\n",
+			c.ClientID, c.ActiveVersion, c.TargetVersion, c.State, c.InCurrentBatch, online, errMsg)
 	}
 	return st
 }

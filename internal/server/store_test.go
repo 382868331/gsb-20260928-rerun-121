@@ -9,7 +9,7 @@ import (
 func TestPublishAndAckStateMonotonic(t *testing.T) {
 	store := newTestStore(t)
 
-	rel, err := store.Publish(map[string]interface{}{"k": "v1"})
+	rel, err := store.Publish(protocol.PublishRequest{Content: map[string]interface{}{"k": "v1"}})
 	if err != nil || rel.Version != 1 {
 		t.Fatalf("发布 v1 失败: %v", err)
 	}
@@ -43,11 +43,11 @@ func TestPublishAndAckStateMonotonic(t *testing.T) {
 
 func TestFailureKeepsOriginalAndStaysPendingForNewVersion(t *testing.T) {
 	store := newTestStore(t)
-	_, _ = store.Publish(map[string]interface{}{"k": "v1"})
+	publishTest(store, map[string]interface{}{"k": "v1"})
 	_, _, _ = store.Touch("c1", 0)
 	_ = store.Ack(protocol.AckRequest{ClientID: "c1", Version: 1, Kind: protocol.AckApplied})
 
-	_, _ = store.Publish(map[string]interface{}{"k": "v2"})
+	publishTest(store, map[string]interface{}{"k": "v2"})
 	// 心跳对账：实际仍在 v1。
 	_, _, _ = store.Touch("c1", 1)
 	_ = store.Ack(protocol.AckRequest{ClientID: "c1", Version: 2, Kind: protocol.AckFailed, Reason: "boom"})
@@ -60,8 +60,8 @@ func TestFailureKeepsOriginalAndStaysPendingForNewVersion(t *testing.T) {
 func TestRestartReconcile(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewStore(dir)
-	_, _ = store.Publish(map[string]interface{}{"k": "v1"})
-	_, _ = store.Publish(map[string]interface{}{"k": "v2"})
+	publishTest(store, map[string]interface{}{"k": "v1"})
+	publishTest(store, map[string]interface{}{"k": "v2"})
 	_, _, _ = store.Touch("c1", 0)
 	_ = store.Ack(protocol.AckRequest{ClientID: "c1", Version: 2, Kind: protocol.AckDownloaded})
 
@@ -87,13 +87,98 @@ func TestRestartReconcile(t *testing.T) {
 
 func TestOldVersionAckIgnored(t *testing.T) {
 	store := newTestStore(t)
-	_, _ = store.Publish(map[string]interface{}{"k": "v1"})
-	_, _ = store.Publish(map[string]interface{}{"k": "v2"})
+	publishTest(store, map[string]interface{}{"k": "v1"})
+	publishTest(store, map[string]interface{}{"k": "v2"})
 	_, _, _ = store.Touch("c1", 0)
 	_ = store.Ack(protocol.AckRequest{ClientID: "c1", Version: 1, Kind: protocol.AckApplied}) // 旧版本
 	if got := clientOf(t, store, "c1"); got.ActiveVersion != 0 {
 		t.Fatalf("旧版本 applied 不应推进当前实际版本: %+v", got)
 	}
+}
+
+func TestStagedRolloutDownloadAndValidationDoNotPromote(t *testing.T) {
+	store := newTestStore(t)
+	publishTest(store, map[string]interface{}{"k": "v1"})
+	_, _, _ = store.Touch("canary", 0)
+	_ = store.Ack(protocol.AckRequest{ClientID: "canary", Version: 1, Kind: protocol.AckApplied})
+
+	_, _ = store.Publish(protocol.PublishRequest{
+		Content:        map[string]interface{}{"k": "v2"},
+		BatchClientIDs: []string{"canary"},
+	})
+	_, _, _ = store.Touch("canary", 1)
+	_, _, _ = store.Touch("next", 1)
+	if _, has, _ := store.Touch("next", 1); has {
+		t.Fatal("后续批次不应拿到 v2 快照")
+	}
+
+	_ = store.Ack(protocol.AckRequest{ClientID: "canary", Version: 2, Kind: protocol.AckDownloaded})
+	if got := clientOf(t, store, "canary"); got.State != protocol.StateDownloaded || got.ActiveVersion != 1 {
+		t.Fatalf("downloaded 不应推进实际版本: %+v", got)
+	}
+	if err := store.PromoteBatch(2, []string{"next"}); err != nil {
+		t.Fatalf("仅下载成功不应阻止后续批次: %v", err)
+	}
+
+	_, _, _ = store.Touch("next", 1)
+	_ = store.Ack(protocol.AckRequest{ClientID: "next", Version: 2, Kind: protocol.AckDownloaded})
+	_ = store.Ack(protocol.AckRequest{ClientID: "next", Version: 2, Kind: protocol.AckValidated})
+	if got := clientOf(t, store, "next"); got.State != protocol.StateValidated || got.ActiveVersion != 1 {
+		t.Fatalf("validated 不是 applied: %+v", got)
+	}
+	if err := store.PromoteBatch(2, []string{"later"}); err != nil {
+		t.Fatalf("校验成功但未真正应用时不应自动视为成功: %v", err)
+	}
+}
+
+func TestApplicationFailureStopsLaterBatchesAndRollbackPreservesHistory(t *testing.T) {
+	store := newTestStore(t)
+	publishTest(store, map[string]interface{}{"k": "v1"})
+	for _, id := range []string{"canary", "next"} {
+		_, _, _ = store.Touch(id, 0)
+		_ = store.Ack(protocol.AckRequest{ClientID: id, Version: 1, Kind: protocol.AckApplied})
+	}
+
+	_, _ = store.Publish(protocol.PublishRequest{
+		Content:        map[string]interface{}{"k": "v2"},
+		BatchClientIDs: []string{"canary"},
+	})
+	_, _, _ = store.Touch("canary", 1)
+	_ = store.Ack(protocol.AckRequest{ClientID: "canary", Version: 2, Kind: protocol.AckDownloaded})
+	_ = store.Ack(protocol.AckRequest{ClientID: "canary", Version: 2, Kind: protocol.AckValidated})
+	_ = store.Ack(protocol.AckRequest{ClientID: "canary", Version: 2, Kind: protocol.AckFailed, Reason: "boom"})
+
+	got := clientOf(t, store, "canary")
+	if got.ActiveVersion != 1 || got.State != protocol.StateFailed || len(got.Failures) != 1 {
+		t.Fatalf("失败后应保留 v1 和失败历史: %+v", got)
+	}
+	if err := store.PromoteBatch(2, []string{"next"}); err == nil {
+		t.Fatal("首批应用失败后必须停止后续批次")
+	}
+
+	if _, err := store.Rollback(1); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _ = store.Touch("canary", 1)
+	got = clientOf(t, store, "canary")
+	if got.ActiveVersion != 1 || got.State != protocol.StateApplied || len(got.Failures) != 1 {
+		t.Fatalf("回退到旧版不得覆盖失败历史: %+v", got)
+	}
+	if err := store.Ack(protocol.AckRequest{ClientID: "canary", Version: 2, Kind: protocol.AckApplied}); err == nil {
+		t.Fatal("回退后迟到的 v2 applied 必须被拒绝")
+	}
+	got = clientOf(t, store, "canary")
+	if got.ActiveVersion != 1 || got.State != protocol.StateApplied {
+		t.Fatalf("迟到旧确认不得改标新版本: %+v", got)
+	}
+}
+
+func publishTest(s *Store, content map[string]interface{}) protocol.Release {
+	rel, err := s.Publish(protocol.PublishRequest{Content: content})
+	if err != nil {
+		panic(err)
+	}
+	return rel
 }
 
 func newTestStore(t *testing.T) *Store {

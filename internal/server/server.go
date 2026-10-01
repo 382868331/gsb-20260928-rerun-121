@@ -31,6 +31,8 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/admin/v1/releases", s.handlePublish)
+	mux.HandleFunc("/admin/v1/batches", s.handlePromoteBatch)
+	mux.HandleFunc("/admin/v1/rollback", s.handleRollback)
 	mux.HandleFunc("/api/v1/releases/latest", s.handleLatest)
 	mux.HandleFunc("/api/v1/releases/", s.handleGetRelease)
 	mux.HandleFunc("/api/v1/register", s.handleRegister)
@@ -68,13 +70,51 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "content 必填（整份配置）")
 		return
 	}
-	rel, err := s.store.Publish(req.Content)
+	rel, err := s.store.Publish(req)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	log.Printf("[server] 发布新版本 v%d checksum=%s", rel.Version, rel.Checksum)
 	writeJSON(w, http.StatusCreated, rel)
+}
+
+func (s *Server) handlePromoteBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "仅支持 POST")
+		return
+	}
+	var req struct {
+		Version        int      `json:"version"`
+		BatchClientIDs []string `json:"batch_client_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体无效: "+err.Error())
+		return
+	}
+	if err := s.store.PromoteBatch(req.Version, req.BatchClientIDs); err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "promoted"})
+}
+
+func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "仅支持 POST")
+		return
+	}
+	var req protocol.RollbackRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体无效: "+err.Error())
+		return
+	}
+	rel, err := s.store.Rollback(req.Version)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, rel)
 }
 
 func (s *Server) handleLatest(w http.ResponseWriter, r *http.Request) {
@@ -127,6 +167,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if has {
 		rel := latest
 		resp.Latest = &rel
+		resp.TargetRelease = &rel
 		resp.TargetVersion = latest.Version
 	}
 	writeJSON(w, http.StatusOK, resp)

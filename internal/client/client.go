@@ -24,6 +24,9 @@ type FailHook func(version int, content map[string]interface{}) string
 // Validator 允许上层对整份配置做业务校验，返回错误则拒绝切换。
 type Validator func(content map[string]interface{}) error
 
+// AckHook 返回 true 时丢弃该确认，用于模拟确认丢失。
+type AckHook func(version int, kind string) bool
+
 type Client struct {
 	ID        string
 	serverURL string
@@ -31,6 +34,7 @@ type Client struct {
 	httpc     *http.Client
 	failHook  FailHook
 	validator Validator
+	ackHook   AckHook
 
 	mu            sync.Mutex
 	activeVersion int
@@ -75,6 +79,12 @@ func (c *Client) SetHTTPClient(hc *http.Client) {
 func (c *Client) SetPaused(p bool) {
 	c.mu.Lock()
 	c.paused = p
+	c.mu.Unlock()
+}
+
+func (c *Client) SetAckHook(h AckHook) {
+	c.mu.Lock()
+	c.ackHook = h
 	c.mu.Unlock()
 }
 
@@ -141,28 +151,38 @@ func (c *Client) SyncOnce() {
 		log.Printf("[%s] 心跳失败（短暂断连，稍后重试）: %v", c.ID, err)
 		return
 	}
-	if resp.Latest == nil || resp.Latest.Version <= c.ActiveVersion() {
-		return // 已是最新
+	target := resp.TargetRelease
+	if target == nil {
+		target = resp.Latest
 	}
-	rel := resp.Latest
+	if target == nil || target.Version == c.ActiveVersion() {
+		return // 已处于服务端授权目标
+	}
+	rel := target
 
-	// 直接取最新完整版本，即使缺少中间版本也无需逐个升级。
+	// 直接取授权目标完整版本；升级、跳级或显式回退都走同一条原子切换路径。
 	full, err := c.download(rel.Version)
 	if err != nil {
 		log.Printf("[%s] 下载 v%d 失败: %v", c.ID, rel.Version, err)
 		return
 	}
-	if Checksum(full.Content) != full.Checksum {
-		c.reportFailure(full.Version, "校验和不一致，拒绝应用")
-		return
-	}
-
 	// 下载确认：明确告诉服务端“只下载了”，绝不等于应用成功。
 	if err := c.ack(full.Version, protocol.AckDownloaded, ""); err != nil {
 		log.Printf("[%s] downloaded 确认失败: %v", c.ID, err)
 	}
+	if Checksum(full.Content) != full.Checksum {
+		c.reportFailure(full.Version, "校验和不一致，拒绝应用")
+		return
+	}
+	if reason := c.validate(full); reason != "" {
+		c.reportFailure(full.Version, reason)
+		return
+	}
+	if err := c.ack(full.Version, protocol.AckValidated, ""); err != nil {
+		log.Printf("[%s] validated 确认失败: %v", c.ID, err)
+	}
 
-	if reason := c.apply(full); reason != "" {
+	if reason := c.switchConfig(full); reason != "" {
 		// 应用失败：active.json 保持原版不变，上报失败原因，状态留待后续。
 		log.Printf("[%s] 应用 v%d 失败，保留 v%d: %s", c.ID, full.Version, c.ActiveVersion(), reason)
 		if err := c.ack(full.Version, protocol.AckFailed, reason); err != nil {
@@ -186,11 +206,22 @@ func (c *Client) SyncOnce() {
 // apply 执行原子切换：写暂存 → 校验 → rename 覆盖。
 // 任何一步失败都返回原因，原 active.json 原样保留。
 func (c *Client) apply(rel *protocol.Release) string {
+	if reason := c.validate(rel); reason != "" {
+		return reason
+	}
+	return c.switchConfig(rel)
+}
+
+func (c *Client) validate(rel *protocol.Release) string {
 	if c.validator != nil {
 		if err := c.validator(rel.Content); err != nil {
 			return "配置校验失败: " + err.Error()
 		}
 	}
+	return ""
+}
+
+func (c *Client) switchConfig(rel *protocol.Release) string {
 	if c.failHook != nil {
 		if reason := c.failHook(rel.Version, rel.Content); reason != "" {
 			return reason
@@ -252,6 +283,13 @@ func (c *Client) reportFailure(version int, reason string) {
 }
 
 func (c *Client) ack(version int, kind, reason string) error {
+	c.mu.Lock()
+	drop := c.ackHook != nil && c.ackHook(version, kind)
+	c.mu.Unlock()
+	if drop {
+		log.Printf("[%s] v%d %s 确认模拟丢失", c.ID, version, kind)
+		return nil
+	}
 	body, _ := json.Marshal(protocol.AckRequest{
 		ClientID: c.ID,
 		Version:  version,
