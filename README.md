@@ -56,6 +56,54 @@ curl -X POST localhost:8080/admin/v1/releases -d '{"content":{...}}'
 | POST | `/api/v1/register` | 注册/心跳：上报 `active_version` 对账，返回最新版本 |
 | POST | `/api/v1/ack` | 确认：`downloaded` / `validated` / `applied` / `failed` |
 
+---
+
+# 多组件兼容组合发布（compat）
+
+在单份配置分发之外，仓库还演示了**相互依赖组件的组合式发布**：
+只有设备上的组合满足兼容约束，才允许把某个组件推进到新版本。
+
+## 核心语义
+
+- 组合（Combo）是设备上各组件版本的完整快照，兼容校验以组合为单位；
+  约束形如 “engine@2 要求 kernel ∈ [2]”，可表达依赖交叉。
+- 操作者先 `POST /admin/v1/preview` 看到每台设备可行的组合与阻碍原因
+  （离线、约束违反、版本已撤回、上一战役未收尾），再圈选批次发起战役。
+- 单个组件的 `downloaded` / `validated` / `applied` 只推进该组件自身状态；
+  组合内全部组件 `applied` 才算整体切换完成，单个组件下载成功
+  不能宣布组合可用。新战役会继承设备上已 applied 的组件版本。
+- 试用期间修改约束（`POST /admin/v1/rules`）或撤回版本
+  （`POST /admin/v1/versions/withdraw`）：已应用设备保留真实状态，
+  未开始设备重新核对并给出阻碍原因，部分应用设备明确列出等待收尾的组件。
+- 回退（`POST /admin/v1/rollback`）必须选择一个仍兼容的完整组合，
+  而不是逐项恢复各自旧值；不兼容的回退组合会被拒绝。
+- 过期战役的迟到确认被拒绝；状态持久化到磁盘，重启后继续核对。
+- 发布决定与规则变化分别记入两条历史：
+  `GET /admin/v1/history/decisions` 与 `GET /admin/v1/history/rules`。
+
+## 快速开始
+
+```bash
+go run ./cmd/compat-simulate   # 演示：依赖交叉、离线设备、迟到确认、撤回、回退、重启
+go run ./cmd/compat-server -addr 127.0.0.1:8081 -data ./compat-runtime
+```
+
+## HTTP API
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST/GET | `/admin/v1/versions` | 登记 / 查看组件版本 |
+| POST | `/admin/v1/versions/withdraw` | 撤回或恢复版本，触发重新核对 |
+| POST/GET | `/admin/v1/rules` | 设置 / 查看兼容约束 |
+| POST | `/admin/v1/preview` | 逐台设备评估可行组合与阻碍原因 |
+| POST | `/admin/v1/campaigns` | 圈选批次发起发布（目标为完整组合） |
+| POST | `/admin/v1/rollback` | 回退到仍兼容的完整组合 |
+| GET | `/admin/v1/status` | 各设备实际组合、目标组合、组件状态、等待收尾项 |
+| GET | `/admin/v1/history/decisions` | 发布决定历史 |
+| GET | `/admin/v1/history/rules` | 规则变化历史 |
+| POST | `/api/v1/heartbeat` | 设备心跳：上报实际生效组合对账 |
+| POST | `/api/v1/ack` | 单组件确认：downloaded / validated / applied / failed |
+
 首批发布示例：
 
 ```json
