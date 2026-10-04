@@ -188,6 +188,64 @@ func TestLateAckRejected(t *testing.T) {
 	}
 }
 
+func TestRollbackPreservesAppliedFacts(t *testing.T) {
+	s := newTestStore(t)
+	publishBase(t, s)
+	old := Combination{"firmware": 1, "rf-driver": 1, "billing-app": 4}
+	target := Combination{"firmware": 3, "rf-driver": 2, "billing-app": 5}
+	register(t, s, "dev-1", old)
+	dec, err := s.Release(ReleaseRequest{Target: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 只应用了 firmware 后开始回退
+	if err := s.Ack(AckRequest{DeviceID: "dev-1", CampaignID: dec.CampaignID, Component: "firmware", Kind: AckApplied}); err != nil {
+		t.Fatal(err)
+	}
+	rb, err := s.Rollback(RollbackRequest{Target: old})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := s.Snapshot(nil)
+	v := st.Devices[0]
+	// 实际组合保留每个组件的真实应用版本：firmware 仍是新版 v3
+	want := Combination{"firmware": 3, "rf-driver": 1, "billing-app": 4}
+	if !v.Current.Equal(want) {
+		t.Fatalf("回退不应擦掉已生效的组件版本, 实际组合 %v", v.Current)
+	}
+	if v.Done {
+		t.Fatal("整组尚未切回旧组合，不应视为完成")
+	}
+	// 只等待确实需要变化的组件（firmware），其余保持已生效事实
+	if got := v.WaitingOn; len(got) != 1 || got[0] != "firmware(pending)" {
+		t.Fatalf("应只等待 firmware 收尾, 实际 %v", got)
+	}
+	if v.Components["rf-driver"].State != CompApplied || v.Components["billing-app"].State != CompApplied {
+		t.Fatal("未变化的组件应直接记为 applied，不重新等待")
+	}
+	// 旧行动的迟到确认不能修改新行动
+	if err := s.Ack(AckRequest{DeviceID: "dev-1", CampaignID: dec.CampaignID, Component: "rf-driver", Kind: AckApplied}); err == nil {
+		t.Fatal("旧行动的迟到确认不应被接受")
+	}
+	// 重新打开状态后仍能解释实际组合
+	s2, err := NewStore(s.dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2 := s2.Snapshot(nil).Devices[0]
+	if !v2.Current.Equal(want) || len(v2.WaitingOn) != 1 {
+		t.Fatalf("重启后应保留真实组合与等待项, 实际 %+v", v2)
+	}
+	// 新行动中 firmware 回退完成后整组才算完成
+	if err := s2.Ack(AckRequest{DeviceID: "dev-1", CampaignID: rb.CampaignID, Component: "firmware", Kind: AckApplied}); err != nil {
+		t.Fatal(err)
+	}
+	v3 := s2.Snapshot(nil).Devices[0]
+	if !v3.Done || !v3.Current.Equal(old) {
+		t.Fatalf("回退收尾后应完成并处于旧组合, 实际 %+v", v3)
+	}
+}
+
 func TestPersistenceAcrossRestart(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewStore(filepath.Join(dir, "srv"))

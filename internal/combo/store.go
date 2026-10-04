@@ -315,7 +315,7 @@ func (s *Store) startCampaign(kind string, target Combination, deviceIDs []strin
 			dec.Rejected[id] = []string{"已处于目标组合"}
 			continue
 		}
-		accepted = append(accepted, id)
+	accepted = append(accepted, id)
 	}
 	if len(accepted) == 0 {
 		return Decision{}, fmt.Errorf("没有可推进的设备")
@@ -336,11 +336,26 @@ func (s *Store) startCampaign(kind string, target Combination, deviceIDs []strin
 	}
 	s.campaigns = append(s.campaigns, camp)
 	for _, id := range accepted {
+		d := s.devices[id]
 		components := map[string]*CompProgress{}
-		for comp := range target {
+		allApplied := true
+		for comp, ver := range target {
+			// 新行动不擦掉已有事实：设备上已真实生效的版本
+			// 直接记为 applied，只等待确实需要变化的组件。
+			if d != nil && d.Current[comp] == ver {
+				components[comp] = &CompProgress{State: CompApplied}
+				continue
+			}
 			components[comp] = &CompProgress{State: CompPending}
+			allApplied = false
 		}
-		s.plans[id] = &DevicePlan{DeviceID: id, Components: components}
+		p := &DevicePlan{DeviceID: id, Components: components}
+		if allApplied {
+			completedAt := dec.At
+			p.Done = true
+			p.CompletedAt = &completedAt
+		}
+		s.plans[id] = p
 	}
 	dec.CampaignID = camp.ID
 	dec.Accepted = accepted
@@ -434,6 +449,14 @@ func (s *Store) Ack(req AckRequest) error {
 	case AckApplied:
 		cp.State = CompApplied
 		cp.Error = ""
+		// 组件级 applied 是事实：立即记入设备实际生效组合，
+		// 与整组组合是否切换完成（Done）分别展示。
+		if d := s.devices[req.DeviceID]; d != nil {
+			if d.Current == nil {
+				d.Current = Combination{}
+			}
+			d.Current[req.Component] = camp.Target[req.Component]
+		}
 	case AckFailed:
 		if cp.State != CompApplied {
 			cp.State = CompFailed
