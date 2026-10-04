@@ -11,12 +11,13 @@ import (
 )
 
 type persistedData struct {
-	Components []ComponentVersion     `json:"components"`
-	Rulesets   []Ruleset              `json:"rulesets"`
-	Campaigns  []Campaign             `json:"campaigns"`
-	Plans      map[string]*DevicePlan `json:"plans"`
-	Devices    map[string]*Device     `json:"devices"`
-	Decisions  []Decision             `json:"decisions"`
+	Components    []ComponentVersion             `json:"components"`
+	Rulesets      []Ruleset                      `json:"rulesets"`
+	Campaigns     []Campaign                     `json:"campaigns"`
+	CampaignPlans map[int]map[string]*DevicePlan `json:"campaign_plans"`
+	Plans         map[string]*DevicePlan         `json:"plans,omitempty"` // 兼容旧格式
+	Devices       map[string]*Device             `json:"devices"`
+	Decisions     []Decision                     `json:"decisions"`
 }
 
 // Store 持久化组件版本、约束规则代次、发布决定与设备真实状态。
@@ -26,7 +27,7 @@ type Store struct {
 	components []ComponentVersion
 	rulesets   []Ruleset
 	campaigns  []Campaign
-	plans      map[string]*DevicePlan // deviceID -> 当前行动中的计划
+	plans      map[int]map[string]*DevicePlan
 	devices    map[string]*Device
 	decisions  []Decision
 }
@@ -34,7 +35,7 @@ type Store struct {
 func NewStore(dataDir string) (*Store, error) {
 	s := &Store{
 		dataDir: dataDir,
-		plans:   map[string]*DevicePlan{},
+		plans:   map[int]map[string]*DevicePlan{},
 		devices: map[string]*Device{},
 		rulesets: []Ruleset{{
 			Generation: 1,
@@ -71,7 +72,22 @@ func (s *Store) load() error {
 	}
 	s.campaigns = p.Campaigns
 	if p.Plans != nil {
-		s.plans = p.Plans
+		s.plans = map[int]map[string]*DevicePlan{}
+		campaignID := 0
+		for i := range s.campaigns {
+			if s.campaigns[i].Active {
+				campaignID = s.campaigns[i].ID
+			}
+		}
+		if campaignID == 0 && len(s.campaigns) > 0 {
+			campaignID = s.campaigns[len(s.campaigns)-1].ID
+		}
+		if campaignID > 0 {
+			s.plans[campaignID] = p.Plans
+		}
+	}
+	if p.CampaignPlans != nil {
+		s.plans = p.CampaignPlans
 	}
 	if p.Devices != nil {
 		s.devices = p.Devices
@@ -82,12 +98,12 @@ func (s *Store) load() error {
 
 func (s *Store) persistLocked() error {
 	p := persistedData{
-		Components: s.components,
-		Rulesets:   s.rulesets,
-		Campaigns:  s.campaigns,
-		Plans:      s.plans,
-		Devices:    s.devices,
-		Decisions:  s.decisions,
+		Components:    s.components,
+		Rulesets:      s.rulesets,
+		Campaigns:     s.campaigns,
+		CampaignPlans: s.plans,
+		Devices:       s.devices,
+		Decisions:     s.decisions,
 	}
 	b, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
@@ -222,7 +238,7 @@ func (s *Store) reevaluateLocked() {
 		return
 	}
 	for _, id := range camp.DeviceIDs {
-		p := s.plans[id]
+		p := s.planLocked(camp.ID, id)
 		if p == nil || p.Done {
 			continue
 		}
@@ -302,13 +318,8 @@ func (s *Store) startCampaign(kind string, target Combination, deviceIDs []strin
 			dec.Rejected[id] = []string{"设备未注册"}
 			continue
 		}
-		// 已处于目标组合且没有未完成的在途行动时，无需推进；
-		// 但若设备卡在未完成的行动中（如部分应用），回退/发布仍要带上它。
+		// 已处于目标组合时无需推进；部分应用由下方按组件生成的计划继续收尾。
 		if d.Current.Equal(target) {
-			if p := s.plans[id]; p == nil || !p.Done {
-				accepted = append(accepted, id)
-				continue
-			}
 			if dec.Rejected == nil {
 				dec.Rejected = map[string][]string{}
 			}
@@ -335,12 +346,9 @@ func (s *Store) startCampaign(kind string, target Combination, deviceIDs []strin
 		Active:     true,
 	}
 	s.campaigns = append(s.campaigns, camp)
+	s.plans[camp.ID] = map[string]*DevicePlan{}
 	for _, id := range accepted {
-		components := map[string]*CompProgress{}
-		for comp := range target {
-			components[comp] = &CompProgress{State: CompPending}
-		}
-		s.plans[id] = &DevicePlan{DeviceID: id, Components: components}
+		s.plans[camp.ID][id] = newDevicePlanLocked(id, target, s.devices[id].Current)
 	}
 	dec.CampaignID = camp.ID
 	dec.Accepted = accepted
@@ -349,6 +357,26 @@ func (s *Store) startCampaign(kind string, target Combination, deviceIDs []strin
 		return Decision{}, err
 	}
 	return dec, nil
+}
+
+func newDevicePlanLocked(deviceID string, target Combination, current Combination) *DevicePlan {
+	components := make(map[string]*CompProgress, len(target))
+	allApplied := true
+	for comp, version := range target {
+		state := CompPending
+		if current[comp] == version {
+			state = CompApplied
+		} else {
+			allApplied = false
+		}
+		components[comp] = &CompProgress{State: state}
+	}
+	plan := &DevicePlan{DeviceID: deviceID, Components: components, Done: allApplied}
+	if allApplied {
+		now := time.Now().UTC()
+		plan.CompletedAt = &now
+	}
+	return plan
 }
 
 // ---- 设备侧 ----
@@ -373,12 +401,28 @@ func (s *Store) Register(req RegisterRequest) (RegisterResponse, error) {
 	if camp == nil {
 		return RegisterResponse{}, s.persistLocked()
 	}
-	p := s.plans[req.DeviceID]
+	p := s.planLocked(camp.ID, req.DeviceID)
 	if p == nil {
 		return RegisterResponse{}, s.persistLocked()
 	}
+	for comp, version := range camp.Target {
+		cp := p.Components[comp]
+		if cp == nil {
+			cp = &CompProgress{}
+			p.Components[comp] = cp
+		}
+		if d.Current[comp] == version {
+			cp.State = CompApplied
+			cp.Error = ""
+			continue
+		}
+		if cp.State == CompApplied {
+			cp.State = CompPending
+		}
+	}
 	if d.Current.Equal(camp.Target) {
 		// 心跳对账：实际组合已等于目标，视为完成（重启恢复路径）。
+		p.Blocked = nil
 		if !p.Done {
 			p.Done = true
 			p.CompletedAt = &now
@@ -408,7 +452,7 @@ func (s *Store) Ack(req AckRequest) error {
 	if req.CampaignID != camp.ID {
 		return fmt.Errorf("迟到确认：行动 %d 已结束，当前行动为 %d", req.CampaignID, camp.ID)
 	}
-	p := s.plans[req.DeviceID]
+	p := s.planLocked(camp.ID, req.DeviceID)
 	if p == nil {
 		return fmt.Errorf("设备 %s 不在当前行动中", req.DeviceID)
 	}
@@ -434,6 +478,12 @@ func (s *Store) Ack(req AckRequest) error {
 	case AckApplied:
 		cp.State = CompApplied
 		cp.Error = ""
+		if d := s.devices[req.DeviceID]; d != nil {
+			if d.Current == nil {
+				d.Current = Combination{}
+			}
+			d.Current[req.Component] = camp.Target[req.Component]
+		}
 	case AckFailed:
 		if cp.State != CompApplied {
 			cp.State = CompFailed
@@ -487,7 +537,7 @@ func (s *Store) Snapshot(online func(id string) bool) StatusResponse {
 			v.Online = online(id)
 		}
 		if camp != nil {
-			if p := s.plans[id]; p != nil {
+			if p := s.planLocked(camp.ID, id); p != nil {
 				v.InCampaign = true
 				v.Target = camp.Target.Clone()
 				v.Components = p.Components
@@ -508,6 +558,13 @@ func (s *Store) activeCampaignLocked() *Campaign {
 		if s.campaigns[i].Active {
 			return &s.campaigns[i]
 		}
+	}
+	return nil
+}
+
+func (s *Store) planLocked(campaignID int, deviceID string) *DevicePlan {
+	if plans := s.plans[campaignID]; plans != nil {
+		return plans[deviceID]
 	}
 	return nil
 }

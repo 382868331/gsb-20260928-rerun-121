@@ -149,6 +149,14 @@ func TestWithdrawReevaluatesDevices(t *testing.T) {
 	if got := views["dev-partial"].WaitingOn; len(got) != 2 {
 		t.Fatalf("部分应用设备应明确等待 2 项收尾, 实际 %v", got)
 	}
+	register(t, s, "dev-fresh", target)
+	views = map[string]DeviceView{}
+	for _, v := range s.Snapshot(nil).Devices {
+		views[v.DeviceID] = v
+	}
+	if !views["dev-fresh"].Done || len(views["dev-fresh"].Blocked) != 0 {
+		t.Fatalf("权威心跳确认完整实际组合后应清除阻塞并完成, 状态=%+v", views["dev-fresh"])
+	}
 }
 
 func TestRollbackMustBeCompatibleCombination(t *testing.T) {
@@ -157,7 +165,11 @@ func TestRollbackMustBeCompatibleCombination(t *testing.T) {
 	old := Combination{"firmware": 1, "rf-driver": 1, "billing-app": 4}
 	register(t, s, "dev-1", old)
 	target := Combination{"firmware": 3, "rf-driver": 2, "billing-app": 5}
-	if _, err := s.Release(ReleaseRequest{Target: target}); err != nil {
+	dec, err := s.Release(ReleaseRequest{Target: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Ack(AckRequest{DeviceID: "dev-1", CampaignID: dec.CampaignID, Component: "firmware", Kind: AckApplied}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.WithdrawVersion("rf-driver", 2); err != nil {
@@ -179,12 +191,100 @@ func TestLateAckRejected(t *testing.T) {
 	old := Combination{"firmware": 1, "rf-driver": 1, "billing-app": 4}
 	register(t, s, "dev-1", old)
 	dec, _ := s.Release(ReleaseRequest{Target: Combination{"firmware": 3, "rf-driver": 2, "billing-app": 5}})
+	if err := s.Ack(AckRequest{DeviceID: "dev-1", CampaignID: dec.CampaignID, Component: "firmware", Kind: AckApplied}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := s.Rollback(RollbackRequest{Target: old}); err != nil {
 		t.Fatal(err)
 	}
 	err := s.Ack(AckRequest{DeviceID: "dev-1", CampaignID: dec.CampaignID, Component: "firmware", Kind: AckApplied})
 	if err == nil {
 		t.Fatal("旧行动的迟到确认不应被接受")
+	}
+}
+
+func TestPartialApplicationSurvivesRollbackAndRestart(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(filepath.Join(dir, "srv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishBase(t, s)
+	old := Combination{"firmware": 1, "rf-driver": 1, "billing-app": 4}
+	target := Combination{"firmware": 3, "rf-driver": 2, "billing-app": 5}
+	register(t, s, "dev-1", old)
+	register(t, s, "dev-2", old)
+	release, err := s.Release(ReleaseRequest{Target: target, DeviceIDs: []string{"dev-1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Ack(AckRequest{
+		DeviceID: "dev-1", CampaignID: release.CampaignID,
+		Component: "firmware", Kind: AckApplied,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rollback, err := s.Rollback(RollbackRequest{Target: old, DeviceIDs: []string{"dev-1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := s.Snapshot(nil).Devices[0]
+	wantMixed := Combination{"firmware": 3, "rf-driver": 1, "billing-app": 4}
+	if !view.Current.Equal(wantMixed) {
+		t.Fatalf("回退不能擦掉已应用版本，实际组合=%v，期望=%v", view.Current, wantMixed)
+	}
+	if view.Done {
+		t.Fatal("完整组合尚未切回，不应标记完成")
+	}
+	if got := view.Components["firmware"].State; got != CompPending {
+		t.Fatalf("firmware 确实需要回退，状态=%s", got)
+	}
+	if got := view.Components["rf-driver"].State; got != CompApplied {
+		t.Fatalf("rf-driver 已在目标版本，不应等待, 状态=%s", got)
+	}
+	if got := view.Components["billing-app"].State; got != CompApplied {
+		t.Fatalf("billing-app 已在目标版本，不应等待, 状态=%s", got)
+	}
+	if got := view.WaitingOn; len(got) != 1 || got[0] != "firmware(pending)" {
+		t.Fatalf("应只等待 firmware，实际=%v", got)
+	}
+
+	err = s.Ack(AckRequest{
+		DeviceID: "dev-1", CampaignID: release.CampaignID,
+		Component: "rf-driver", Kind: AckApplied,
+	})
+	if err == nil {
+		t.Fatal("旧行动的迟到确认不应被接受")
+	}
+	view = s.Snapshot(nil).Devices[0]
+	if !view.Current.Equal(wantMixed) {
+		t.Fatalf("迟到确认不能修改事实, 实际=%v", view.Current)
+	}
+	if view.Components["rf-driver"].State != CompApplied {
+		t.Fatal("迟到确认不能影响新行动中已完成的 rf-driver")
+	}
+	if err := s.Ack(AckRequest{
+		DeviceID: "dev-2", CampaignID: release.CampaignID,
+		Component: "firmware", Kind: AckApplied,
+	}); err == nil {
+		t.Fatal("未纳入新行动的设备，其旧行动确认也应被拒绝")
+	}
+
+	if err := s.Ack(AckRequest{
+		DeviceID: "dev-1", CampaignID: rollback.CampaignID,
+		Component: "firmware", Kind: AckApplied,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := NewStore(filepath.Join(dir, "srv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	view = reopened.Snapshot(nil).Devices[0]
+	if !view.Current.Equal(old) || !view.Done {
+		t.Fatalf("重开后应解释完整实际组合，current=%v done=%v", view.Current, view.Done)
 	}
 }
 

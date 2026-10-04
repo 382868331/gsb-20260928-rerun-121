@@ -124,7 +124,7 @@ type CompProgress struct {
 	Error string `json:"error,omitempty"`
 }
 
-// DevicePlan 是某台设备在当前行动中的推进计划与真实进度。
+// DevicePlan 是某台设备在当前行动中的推进计划；组件状态反映真实版本进度。
 type DevicePlan struct {
 	DeviceID    string                   `json:"device_id"`
 	Components  map[string]*CompProgress `json:"components"`
@@ -168,7 +168,8 @@ type Decision struct {
 	At         time.Time           `json:"at"`
 }
 
-// Device 是服务端记录的设备真实状态（心跳自报的当前生效组合）。
+// Device 是服务端记录的设备真实状态（心跳或组件 applied 确认的当前生效版本）。
+// 多组件切换期间，这里可能是来自新旧两个组合的混合实际版本。
 type Device struct {
 	ID       string      `json:"id"`
 	Current  Combination `json:"current"`
