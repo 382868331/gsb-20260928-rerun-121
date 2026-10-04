@@ -68,3 +68,60 @@ curl -X POST localhost:8080/admin/v1/releases -d '{"content":{...}}'
 `downloaded`、`validated` 与 `applied` 是三个独立确认；服务端只有在收到
 `applied`，或重启后心跳确认实际生效版本已等于目标时，才把客户端标记为完成。
 不在当前批次中的客户端状态为 `waiting`，心跳不会取得新快照。
+
+---
+
+# 多组件组合发布（combo）
+
+`internal/combo` + `cmd/combosim` 演示**相互依赖的多组件按整组组合推进**，
+只有设备上的组合满足兼容约束，才允许把组件推进到新版本。
+
+## 核心语义
+
+- 设备状态是一整组**组合**（如 `{firmware=v3, rf-driver=v2, billing-app=v5}`），
+  不是各组件独立的版本列表。
+- 兼容约束是**交叉依赖规则**：`When` 成立时 `Require` 必须同时成立
+  （例如 `rf-driver>=2 ⇒ firmware>=3`）。每次修改规则生成新的**代次**，
+  全部代次保留在规则历史中。
+- 操作者先 `plan` 预演：逐设备看到能否采用目标组合与**阻碍原因**，
+  再选择一批设备 `release` 尝试。
+- 组件级确认严格区分 `downloaded / validated / applied`：
+  **单个组件下载成功不代表整组可用**；只有全部组件 `applied`
+  （或重启后心跳自报组合已等于目标），设备才算完成。
+- 试用期间**修改约束或撤回版本**时：
+  - 已完成设备**保留真实状态**，不被改写；
+  - 尚未开始的设备按新规则/版本清单**重新核对**，不满足则给出阻碍原因；
+  - 部分应用的设备不清除进度，`waiting_on` 明确列出**等待哪项收尾**。
+- **回退**是选择一个仍然兼容的整组组合作为目标，而不是逐项恢复各自旧值；
+  含已撤回版本的回退组合会被拒绝。
+- 确认携带行动 ID，旧行动的**迟到确认**直接拒绝。
+- 全部状态持久化到磁盘，重启后继续核对组合状态；
+  **发布决定历史**与**后来的规则变化**分别可查
+  （`/admin/v1/combo/decisions` 与 `/admin/v1/combo/rules/history`）。
+
+## 运行演示
+
+```bash
+go run ./cmd/combosim
+```
+
+演示使用虚构组件 `firmware / rf-driver / billing-app`，依次展示：
+交叉依赖阻碍预演 → 选批发布 → 下载成功≠组合可用 → 部分应用等待收尾 →
+撤回版本触发重核 → 含撤回版本的回退被拒 → 整组回退 → 迟到确认被拒 →
+重启恢复 → 决定历史与规则历史分别查询。
+
+## HTTP API（combo）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/admin/v1/combo/components/versions` | 发布组件版本 |
+| POST | `/admin/v1/combo/components/withdraw` | 撤回组件版本（触发未开始设备重核） |
+| GET/POST | `/admin/v1/combo/rules` | 查看 / 以新代次替换兼容约束 |
+| GET | `/admin/v1/combo/rules/history` | 规则代次历史 |
+| POST | `/admin/v1/combo/plan` | 预演：逐设备可行性与阻碍原因 |
+| POST | `/admin/v1/combo/releases` | 选择一批设备尝试推进到目标组合 |
+| POST | `/admin/v1/combo/rollback` | 回退到仍兼容的整组组合 |
+| GET | `/admin/v1/combo/status` | 各设备实际组合、进度、等待项、阻碍原因 |
+| GET | `/admin/v1/combo/decisions` | 发布/回退决定历史（只追加） |
+| POST | `/api/v1/combo/register` | 设备心跳：上报实际组合，取回目标 |
+| POST | `/api/v1/combo/ack` | 组件级确认：`downloaded/validated/applied/failed` |
