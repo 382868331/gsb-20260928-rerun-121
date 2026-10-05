@@ -2,6 +2,7 @@ package combo
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -281,5 +282,217 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 	}
 	if got := len(s2.RulesetHistory()); got != 2 {
 		t.Fatalf("重启后规则代次历史应保留, 实际 %d 代", got)
+	}
+}
+
+func setupBatchCampaign(t *testing.T, s *Store) Decision {
+	t.Helper()
+	publishBase(t, s)
+	old := Combination{"firmware": 1, "rf-driver": 1, "billing-app": 4}
+	for _, id := range []string{"dev-1", "dev-2", "dev-3"} {
+		register(t, s, id, old)
+	}
+	target := Combination{"firmware": 3, "rf-driver": 2, "billing-app": 5}
+	dec, err := s.Release(ReleaseRequest{
+		Target: target,
+		Batches: []BatchRequest{
+			{DeviceIDs: []string{"dev-1"}, Condition: BatchCondition{Kind: "all"}},
+			{DeviceIDs: []string{"dev-2", "dev-3"}, Condition: BatchCondition{Kind: "count", Count: 2}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dec
+}
+
+func applyAll(t *testing.T, s *Store, device string, campaignID int) {
+	t.Helper()
+	for _, comp := range []string{"firmware", "rf-driver", "billing-app"} {
+		if err := s.Ack(AckRequest{DeviceID: device, CampaignID: campaignID, Component: comp, Kind: AckApplied}); err != nil {
+			// 组件在新目标中版本未变时，计划创建即记为 applied，设备可能提前完成。
+			if strings.Contains(err.Error(), "已完成当前行动") {
+				return
+			}
+			t.Fatalf("%s %s applied: %v", device, comp, err)
+		}
+	}
+}
+
+func TestBatchAdvanceRequiresCondition(t *testing.T) {
+	s := newTestStore(t)
+	dec := setupBatchCampaign(t, s)
+
+	// 条件未满足时推进被拒。
+	if _, err := s.AdvanceBatch(); err == nil {
+		t.Fatal("试运行批未完成时不应允许推进")
+	}
+	// 后续批次设备心跳拿不到目标（上一批完成不代表本批开始）。
+	resp, err := s.Register(RegisterRequest{DeviceID: "dev-2", Current: Combination{"firmware": 1, "rf-driver": 1, "billing-app": 4}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Target != nil {
+		t.Fatal("批次未推进前 dev-2 不应收到目标")
+	}
+	// 后续批次设备的确认按迟到处理。
+	if err := s.Ack(AckRequest{DeviceID: "dev-2", CampaignID: dec.CampaignID, Component: "firmware", Kind: AckApplied}); err == nil {
+		t.Fatal("批次未推进前 dev-2 的确认应被拒绝")
+	}
+
+	applyAll(t, s, "dev-1", dec.CampaignID)
+	adv, err := s.AdvanceBatch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adv.Batch != 0 {
+		t.Fatalf("推进决定应记录批次 0, 实际 %d", adv.Batch)
+	}
+	st := s.Snapshot(nil)
+	if len(st.Batches) != 2 || st.Batches[0].State != BatchDone || st.Batches[1].State != BatchActive {
+		t.Fatalf("批次状态错误: %+v", st.Batches)
+	}
+	// 各批独立展示：第二批设备仍 pending，不带第一批的完成状态。
+	for _, dv := range st.Batches[1].Devices {
+		if dv.Done || len(dv.WaitingOn) != 3 {
+			t.Fatalf("第二批设备应独立处于待推进状态: %+v", dv)
+		}
+	}
+	// 推进后 dev-1 的迟到确认（旧批次）被拒绝。
+	if err := s.Ack(AckRequest{DeviceID: "dev-1", CampaignID: dec.CampaignID, Component: "firmware", Kind: AckApplied}); err == nil {
+		t.Fatal("上一批设备的迟到确认不应越过当前批次")
+	}
+	// 第二批满足 count=2 后行动完成。
+	applyAll(t, s, "dev-2", dec.CampaignID)
+	applyAll(t, s, "dev-3", dec.CampaignID)
+	if _, err := s.AdvanceBatch(); err != nil {
+		t.Fatal(err)
+	}
+	if st := s.Snapshot(nil); st.Campaign != nil {
+		t.Fatal("全部批次完成后行动应结束")
+	}
+}
+
+func TestPauseBlocksAdvance(t *testing.T) {
+	s := newTestStore(t)
+	dec := setupBatchCampaign(t, s)
+	applyAll(t, s, "dev-1", dec.CampaignID)
+
+	if _, err := s.SetPaused(true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AdvanceBatch(); err == nil {
+		t.Fatal("暂停推进期间不应允许进入下一批")
+	}
+	if _, err := s.SetPaused(false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AdvanceBatch(); err != nil {
+		t.Fatal("恢复后应允许推进")
+	}
+}
+
+func TestRollbackFailedOnly(t *testing.T) {
+	s := newTestStore(t)
+	dec := setupBatchCampaign(t, s)
+	// dev-1 部分应用后 billing-app 失败。
+	_ = s.Ack(AckRequest{DeviceID: "dev-1", CampaignID: dec.CampaignID, Component: "firmware", Kind: AckApplied})
+	_ = s.Ack(AckRequest{DeviceID: "dev-1", CampaignID: dec.CampaignID, Component: "rf-driver", Kind: AckApplied})
+	if err := s.Ack(AckRequest{DeviceID: "dev-1", CampaignID: dec.CampaignID, Component: "billing-app", Kind: AckFailed, Reason: "校验失败"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 失败原因在本批视图中独立展示。
+	st0 := s.Snapshot(nil)
+	if len(st0.Batches[0].Devices[0].Failed) != 1 {
+		t.Fatalf("dev-1 的失败原因应展示, 实际 %v", st0.Batches[0].Devices[0].Failed)
+	}
+
+	old := Combination{"firmware": 1, "rf-driver": 1, "billing-app": 4}
+	rb, err := s.Rollback(RollbackRequest{Target: old, FailedOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rb.Accepted) != 1 || rb.Accepted[0] != "dev-1" {
+		t.Fatalf("只回退失败设备应只包含 dev-1, 实际 %v", rb.Accepted)
+	}
+	// 回退后旧行动的迟到确认不得改变已回退的事实。
+	if err := s.Ack(AckRequest{DeviceID: "dev-1", CampaignID: dec.CampaignID, Component: "billing-app", Kind: AckApplied}); err == nil {
+		t.Fatal("旧行动的迟到确认应被拒绝")
+	}
+	applyAll(t, s, "dev-1", rb.CampaignID)
+	if _, err := s.AdvanceBatch(); err != nil {
+		t.Fatal(err)
+	}
+	// dev-2/dev-3 不在回退范围内，保持原组合继续服务。
+	for _, dv := range s.Snapshot(nil).Devices {
+		if dv.DeviceID == "dev-1" {
+			if !dv.Current.Equal(old) {
+				t.Fatalf("dev-1 应回退到旧组合, 实际 %v", dv.Current)
+			}
+		}
+	}
+}
+
+func TestBatchStatePersistsAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(filepath.Join(dir, "srv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec := setupBatchCampaign(t, s)
+	applyAll(t, s, "dev-1", dec.CampaignID)
+	if _, err := s.AdvanceBatch(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetPaused(true); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Ack(AckRequest{DeviceID: "dev-2", CampaignID: dec.CampaignID, Component: "firmware", Kind: AckApplied})
+
+	s2, err := NewStore(filepath.Join(dir, "srv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := s2.Snapshot(nil)
+	if st.Campaign == nil || st.Campaign.ActiveBatch != 1 || !st.Paused {
+		t.Fatalf("重启后当前批次与暂停状态应保留: %+v", st.Campaign)
+	}
+	if st.Batches[0].State != BatchDone || st.Batches[1].State != BatchActive {
+		t.Fatalf("重启后各批决定应保留: %+v", st.Batches)
+	}
+	// dev-2 的实际确认保留；dev-3 仍待推进。
+	var d2, d3 DeviceView
+	for _, dv := range st.Batches[1].Devices {
+		switch dv.DeviceID {
+		case "dev-2":
+			d2 = dv
+		case "dev-3":
+			d3 = dv
+		}
+	}
+	if d2.Current["firmware"] != 3 || len(d2.WaitingOn) != 2 {
+		t.Fatalf("重启后 dev-2 的实际确认应保留: %+v", d2)
+	}
+	if len(d3.WaitingOn) != 3 {
+		t.Fatalf("重启后 dev-3 应仍待推进: %+v", d3)
+	}
+	// 暂停状态持久化：恢复前不能推进。
+	if _, err := s2.AdvanceBatch(); err == nil {
+		t.Fatal("重启后暂停状态应继续生效")
+	}
+	// 决定历史包含 release / advance / pause。
+	var kinds []string
+	for _, d := range s2.Decisions() {
+		kinds = append(kinds, d.Kind)
+	}
+	want := []string{"release", "advance", "pause"}
+	if len(kinds) != len(want) {
+		t.Fatalf("决定历史应为 %v, 实际 %v", want, kinds)
+	}
+	for i := range want {
+		if kinds[i] != want[i] {
+			t.Fatalf("决定历史应为 %v, 实际 %v", want, kinds)
+		}
 	}
 }

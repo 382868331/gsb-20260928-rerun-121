@@ -85,6 +85,15 @@ curl -X POST localhost:8080/admin/v1/releases -d '{"content":{...}}'
   全部代次保留在规则历史中。
 - 操作者先 `plan` 预演：逐设备看到能否采用目标组合与**阻碍原因**，
   再选择一批设备 `release` 尝试。
+- **分批推进**：发布时把设备划分为有序批次（第一批通常是试运行组），
+  每批声明**组件确认条件**（`all`：批内全部设备整组完成；`count`：至少 N 台
+  全部组件 applied）。当前批达到条件后，操作者显式 `advance` 才进入下一批；
+  后续批次设备心跳拿不到目标，提前确认按迟到拒绝。
+- 各批**独立展示**：每批设备的实际组合、等待组件与失败原因只反映本批事实，
+  不用上一批的完成状态代表后续批次。
+- 允许**暂停/恢复推进**（当前批可继续收尾，暂停期间不得进入下一批）；
+  也允许**只回退失败设备**（`failed_only`），已经采用新组合的其它设备
+  不在回退范围内，可继续服务。
 - 组件级确认严格区分 `downloaded / validated / applied`：
   **单个组件下载成功不代表整组可用**；只有全部组件 `applied`
   （或重启后心跳自报组合已等于目标），设备才算完成。
@@ -98,7 +107,10 @@ curl -X POST localhost:8080/admin/v1/releases -d '{"content":{...}}'
 - **回退**是选择一个仍然兼容的整组组合作为目标，而不是逐项恢复各自旧值；
   含已撤回版本的回退组合会被拒绝。
 - 确认携带行动 ID，旧行动的**迟到确认**直接拒绝。
+- 迟到确认不得越过当前批次：设备所属批次必须是当前推进批次；
+  回退完成后旧行动的确认也不能改变已经回退的事实。
 - 全部状态持久化到磁盘，重启后继续核对组合状态；
+  **每批决定、实际确认与仍待推进的范围**重开后保留；
   **发布决定历史**与**后来的规则变化**分别可查
   （`/admin/v1/combo/decisions` 与 `/admin/v1/combo/rules/history`）。
 
@@ -109,9 +121,10 @@ go run ./cmd/combosim
 ```
 
 演示使用虚构组件 `firmware / rf-driver / billing-app`，依次展示：
-交叉依赖阻碍预演 → 选批发布 → 下载成功≠组合可用 → 部分应用等待收尾 →
-撤回版本触发重核 → 含撤回版本的回退被拒 → 整组回退 → 迟到确认被拒 →
-重启恢复 → 决定历史与规则历史分别查询。
+交叉依赖阻碍预演 → 分批发布（试运行批 + 后续批）→ 下载成功≠组合可用 →
+部分应用等待收尾 → 后续批次独立等待、提前确认被拒 → 条件未满足/暂停期间
+推进被拒 → 失败原因按批独立展示 → 只回退失败设备 → 旧行动迟到确认被拒 →
+重启恢复待推进范围 → 决定历史（含分批/推进/暂停）与规则历史分别查询。
 
 ## HTTP API（combo）
 
@@ -122,9 +135,11 @@ go run ./cmd/combosim
 | GET/POST | `/admin/v1/combo/rules` | 查看 / 以新代次替换兼容约束 |
 | GET | `/admin/v1/combo/rules/history` | 规则代次历史 |
 | POST | `/admin/v1/combo/plan` | 预演：逐设备可行性与阻碍原因 |
-| POST | `/admin/v1/combo/releases` | 选择一批设备尝试推进到目标组合 |
-| POST | `/admin/v1/combo/rollback` | 回退到仍兼容的整组组合 |
-| GET | `/admin/v1/combo/status` | 各设备实际组合、进度、等待项、阻碍原因 |
+| POST | `/admin/v1/combo/releases` | 分批发布：`batches` 指定各批设备与确认条件 |
+| POST | `/admin/v1/combo/batches/advance` | 当前批满足确认条件后推进下一批 |
+| POST | `/admin/v1/combo/pause` / `/admin/v1/combo/resume` | 暂停 / 恢复推进 |
+| POST | `/admin/v1/combo/rollback` | 回退到仍兼容的整组组合；`failed_only` 只回退失败设备 |
+| GET | `/admin/v1/combo/status` | 按批独立展示各设备实际组合、等待项、失败原因 |
 | GET | `/admin/v1/combo/decisions` | 发布/回退决定历史（只追加） |
 | POST | `/api/v1/combo/register` | 设备心跳：上报实际组合，取回目标 |
 | POST | `/api/v1/combo/ack` | 组件级确认：`downloaded/validated/applied/failed` |

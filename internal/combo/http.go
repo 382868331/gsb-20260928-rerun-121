@@ -39,6 +39,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/admin/v1/combo/plan", s.handlePlan)
 	mux.HandleFunc("/admin/v1/combo/releases", s.handleRelease)
 	mux.HandleFunc("/admin/v1/combo/rollback", s.handleRollback)
+	mux.HandleFunc("/admin/v1/combo/batches/advance", s.handleAdvance)
+	mux.HandleFunc("/admin/v1/combo/pause", s.handlePause)
+	mux.HandleFunc("/admin/v1/combo/resume", s.handleResume)
 	mux.HandleFunc("/admin/v1/combo/status", s.handleStatus)
 	mux.HandleFunc("/admin/v1/combo/decisions", s.handleDecisions)
 	mux.HandleFunc("/api/v1/combo/register", s.handleRegister)
@@ -161,6 +164,43 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.store.Snapshot(s.isOnline))
+}
+
+// POST /admin/v1/combo/batches/advance 当前批满足确认条件后推进下一批。
+func (s *Server) handleAdvance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "仅支持 POST")
+		return
+	}
+	dec, err := s.store.AdvanceBatch()
+	if err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, dec)
+}
+
+// POST /admin/v1/combo/pause 暂停推进（当前批可继续收尾，不能进入下一批）。
+func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
+	s.handlePauseResume(w, r, true)
+}
+
+// POST /admin/v1/combo/resume 恢复推进。
+func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
+	s.handlePauseResume(w, r, false)
+}
+
+func (s *Server) handlePauseResume(w http.ResponseWriter, r *http.Request, paused bool) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "仅支持 POST")
+		return
+	}
+	dec, err := s.store.SetPaused(paused)
+	if err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, dec)
 }
 
 // GET /admin/v1/combo/decisions 发布/回退决定历史。

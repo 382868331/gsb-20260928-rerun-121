@@ -107,15 +107,51 @@ type Ruleset struct {
 	ChangedAt  time.Time `json:"changed_at"`
 }
 
+// BatchCondition 是每批推进前需要满足的组件确认条件：
+// kind=all 要求批内全部设备整组完成；kind=count 要求至少 Count 台
+// 设备的全部组件都已 applied。达到条件后由操作者显式确认推进下一批。
+type BatchCondition struct {
+	Kind  string `json:"kind"` // all | count
+	Count int    `json:"count,omitempty"`
+}
+
+func (c BatchCondition) String() string {
+	if c.Kind == "count" {
+		return fmt.Sprintf("至少 %d 台设备全部组件 applied", c.Count)
+	}
+	return "批内全部设备整组完成"
+}
+
+// 批次状态：等待推进 / 进行中 / 条件已满足并确认完成。
+const (
+	BatchWaiting = "waiting"
+	BatchActive  = "active"
+	BatchDone    = "done"
+)
+
+// Batch 是组合发布中的一个推进批次。各批独立记录设备范围、
+// 确认条件与完成时刻，不允许用上一批的完成状态代表后续批次。
+type Batch struct {
+	Index      int            `json:"index"`
+	DeviceIDs  []string       `json:"device_ids"`
+	Condition  BatchCondition `json:"condition"`
+	State      string         `json:"state"`
+	StartedAt  *time.Time     `json:"started_at,omitempty"`
+	FinishedAt *time.Time     `json:"finished_at,omitempty"`
+}
+
 // Campaign 是一次针对“整组组合”的发布/回退行动。
 type Campaign struct {
-	ID         int         `json:"id"`
-	Kind       string      `json:"kind"` // release | rollback
-	Target     Combination `json:"target"`
-	DeviceIDs  []string    `json:"device_ids"`
-	RulesetGen int         `json:"ruleset_gen"` // 决策时使用的约束代次
-	CreatedAt  time.Time   `json:"created_at"`
-	Active     bool        `json:"active"`
+	ID          int         `json:"id"`
+	Kind        string      `json:"kind"` // release | rollback
+	Target      Combination `json:"target"`
+	DeviceIDs   []string    `json:"device_ids"`
+	RulesetGen  int         `json:"ruleset_gen"` // 决策时使用的约束代次
+	CreatedAt   time.Time   `json:"created_at"`
+	Active      bool        `json:"active"`
+	Batches     []Batch     `json:"batches,omitempty"`
+	ActiveBatch int         `json:"active_batch"` // 当前批次下标，-1 表示无
+	Paused      bool        `json:"paused"`       // 暂停推进：不允许确认进入下一批
 }
 
 // CompProgress 记录设备上单个组件的推进状态。
@@ -127,6 +163,7 @@ type CompProgress struct {
 // DevicePlan 是某台设备在当前行动中的推进计划与真实进度。
 type DevicePlan struct {
 	DeviceID    string                   `json:"device_id"`
+	Batch       int                      `json:"batch"` // 所属批次下标
 	Components  map[string]*CompProgress `json:"components"`
 	Blocked     []string                 `json:"blocked,omitempty"` // 重新核对后的阻碍原因
 	Done        bool                     `json:"done"`
@@ -159,12 +196,15 @@ func (p *DevicePlan) WaitingOn() []string {
 // 后来约束规则的变化记录在 Ruleset 历史里，两者分别可查。
 type Decision struct {
 	Seq        int                 `json:"seq"`
-	Kind       string              `json:"kind"`
+	Kind       string              `json:"kind"` // release | rollback | advance | pause | resume
 	CampaignID int                 `json:"campaign_id"`
+	Batch      int                 `json:"batch,omitempty"` // advance 决定的批次下标
 	Target     Combination         `json:"target"`
 	RulesetGen int                 `json:"ruleset_gen"`
+	Batches    []Batch             `json:"batches,omitempty"` // release/rollback 决定的批次划分
 	Accepted   []string            `json:"accepted"`
 	Rejected   map[string][]string `json:"rejected,omitempty"` // 设备 -> 阻碍原因
+	Note       string              `json:"note,omitempty"`
 	At         time.Time           `json:"at"`
 }
 
@@ -197,13 +237,21 @@ type PlanResponse struct {
 }
 
 type ReleaseRequest struct {
-	Target    Combination `json:"target"`
-	DeviceIDs []string    `json:"device_ids"`
+	Target    Combination    `json:"target"`
+	DeviceIDs []string       `json:"device_ids"`        // 兼容旧用法：不分批时的一批设备
+	Batches   []BatchRequest `json:"batches,omitempty"` // 分批推进：试运行批 + 后续批
+}
+
+// BatchRequest 描述一个批次的设备范围与推进确认条件。
+type BatchRequest struct {
+	DeviceIDs []string       `json:"device_ids"`
+	Condition BatchCondition `json:"condition"`
 }
 
 type RollbackRequest struct {
-	Target    Combination `json:"target"`
-	DeviceIDs []string    `json:"device_ids,omitempty"`
+	Target     Combination `json:"target"`
+	DeviceIDs  []string    `json:"device_ids,omitempty"`
+	FailedOnly bool        `json:"failed_only,omitempty"` // 只回退当前行动中失败的设备
 }
 
 type RegisterRequest struct {
@@ -231,11 +279,23 @@ type DeviceView struct {
 	Online     bool                     `json:"online"`
 	LastSeen   *time.Time               `json:"last_seen,omitempty"`
 	InCampaign bool                     `json:"in_campaign"`
+	Batch      int                      `json:"batch,omitempty"`
 	Target     Combination              `json:"target,omitempty"`
 	Components map[string]*CompProgress `json:"components,omitempty"`
 	WaitingOn  []string                 `json:"waiting_on,omitempty"`
+	Failed     []string                 `json:"failed,omitempty"` // 组件失败原因列表
 	Blocked    []string                 `json:"blocked,omitempty"`
 	Done       bool                     `json:"done"`
+}
+
+// BatchView 是单个批次的独立视图：本批设备的实际组合、等待组件与
+// 失败原因只反映本批事实，与前后批次互不代表。
+type BatchView struct {
+	Index        int            `json:"index"`
+	State        string         `json:"state"`
+	Condition    BatchCondition `json:"condition"`
+	ConditionMet bool           `json:"condition_met"`
+	Devices      []DeviceView   `json:"devices"`
 }
 
 type StatusResponse struct {
@@ -243,5 +303,7 @@ type StatusResponse struct {
 	RulesetGen int                `json:"ruleset_gen"`
 	Rules      []Rule             `json:"rules"`
 	Campaign   *Campaign          `json:"campaign,omitempty"`
+	Paused     bool               `json:"paused,omitempty"`
+	Batches    []BatchView        `json:"batches,omitempty"`
 	Devices    []DeviceView       `json:"devices"`
 }
