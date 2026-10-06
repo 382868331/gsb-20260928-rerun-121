@@ -283,3 +283,143 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 		t.Fatalf("重启后规则代次历史应保留, 实际 %d 代", got)
 	}
 }
+
+func ackAll(t *testing.T, s *Store, campaignID, batchNo int, deviceID string, target Combination) {
+	t.Helper()
+	for comp := range target {
+		if err := s.Ack(AckRequest{
+			DeviceID:   deviceID,
+			CampaignID: campaignID,
+			BatchNo:    batchNo,
+			Component:  comp,
+			Kind:       AckApplied,
+		}); err != nil {
+			t.Fatalf("确认 %s 失败: %v", comp, err)
+		}
+	}
+}
+
+func TestStagedReleaseBatchGatePauseAndRestart(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(filepath.Join(dir, "srv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishBase(t, s)
+	old := Combination{"firmware": 1, "rf-driver": 1, "billing-app": 4}
+	target := Combination{"firmware": 3, "rf-driver": 2, "billing-app": 5}
+	register(t, s, "canary", old)
+	register(t, s, "next", old)
+
+	dec, err := s.Release(ReleaseRequest{Target: target, Batches: []BatchSpec{
+		{Name: "试运行", DeviceIDs: []string{"canary"}, RequiredComponents: []string{"firmware", "rf-driver", "billing-app"}},
+		{Name: "扩大", DeviceIDs: []string{"next"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cid := dec.CampaignID
+
+	if err := s.Ack(AckRequest{DeviceID: "canary", CampaignID: cid, BatchNo: 1, Component: "firmware", Kind: AckApplied}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Ack(AckRequest{DeviceID: "canary", CampaignID: cid, BatchNo: 1, Component: "rf-driver", Kind: AckApplied}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AdvanceBatch(BatchAdvanceRequest{CampaignID: cid}); err == nil {
+		t.Fatal("首批 billing-app 未确认时不得推进")
+	}
+
+	if _, err := s.PauseCampaign(cid); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Ack(AckRequest{DeviceID: "canary", CampaignID: cid, BatchNo: 1, Component: "billing-app", Kind: AckApplied}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AdvanceBatch(BatchAdvanceRequest{CampaignID: cid}); err == nil {
+		t.Fatal("暂停期间不得推进下一批")
+	}
+
+	s2, err := NewStore(filepath.Join(dir, "srv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := s2.Snapshot(nil)
+	if st.Campaign == nil || !st.Campaign.Paused || st.Campaign.CurrentBatchNo != 1 {
+		t.Fatalf("重启后应保留暂停状态和当前批次: %+v", st.Campaign)
+	}
+	if len(st.Batches) != 2 || st.Batches[1].Status != BatchPending || len(st.Batches[1].Devices) != 1 {
+		t.Fatalf("后续批次应独立保留为 pending: %+v", st.Batches)
+	}
+
+	if _, err := s2.ResumeCampaign(cid); err != nil {
+		t.Fatal(err)
+	}
+	adv, err := s2.AdvanceBatch(BatchAdvanceRequest{CampaignID: cid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adv.BatchNo != 2 || len(adv.Accepted) != 1 || adv.Accepted[0] != "next" {
+		t.Fatalf("第二批准入决定错误: %+v", adv)
+	}
+
+	err = s2.Ack(AckRequest{DeviceID: "canary", CampaignID: cid, BatchNo: 1, Component: "firmware", Kind: AckApplied})
+	if err == nil {
+		t.Fatal("上一批的迟到确认不得越过当前批次")
+	}
+	ackAll(t, s2, cid, 2, "next", target)
+	st = s2.Snapshot(nil)
+	if len(st.Batches[0].Devices) != 1 || len(st.Batches[1].Devices) != 1 {
+		t.Fatal("每批设备状态必须独立展示")
+	}
+}
+
+func TestStagedRollbackOnlyFailedDeviceKeepsOthersServing(t *testing.T) {
+	s := newTestStore(t)
+	publishBase(t, s)
+	old := Combination{"firmware": 1, "rf-driver": 1, "billing-app": 4}
+	target := Combination{"firmware": 3, "rf-driver": 2, "billing-app": 5}
+	register(t, s, "dev-ok", old)
+	register(t, s, "dev-bad", old)
+	dec, err := s.Release(ReleaseRequest{Target: target, Batches: []BatchSpec{
+		{DeviceIDs: []string{"dev-ok", "dev-bad"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cid := dec.CampaignID
+	ackAll(t, s, cid, 1, "dev-ok", target)
+	if err := s.Ack(AckRequest{DeviceID: "dev-bad", CampaignID: cid, BatchNo: 1, Component: "firmware", Kind: AckFailed, Reason: "切换失败"}); err != nil {
+		t.Fatal(err)
+	}
+
+	rb, err := s.Rollback(RollbackRequest{CampaignID: cid, OnlyFailed: true, Target: old})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rb.Accepted) != 1 || rb.Accepted[0] != "dev-bad" {
+		t.Fatalf("只应回退失败设备: %+v", rb)
+	}
+	st := s.Snapshot(nil)
+	batch := st.Batches[0]
+	if len(batch.DeviceIDs) != 1 || batch.DeviceIDs[0] != "dev-ok" {
+		t.Fatalf("失败设备移出推进范围后，其它设备继续服务: %+v", batch)
+	}
+	if len(batch.RolledBackDeviceIDs) != 1 {
+		t.Fatal("回退事实必须保留在批次中")
+	}
+	if err := s.Ack(AckRequest{DeviceID: "dev-bad", CampaignID: cid, BatchNo: 1, Component: "rf-driver", Kind: AckApplied}); err == nil {
+		t.Fatal("已回退设备不能再接受原批次迟到确认")
+	}
+	register(t, s, "dev-bad", old)
+	st = s.Snapshot(nil)
+	var bad DeviceView
+	for _, d := range st.Batches[0].Devices {
+		if d.DeviceID == "dev-bad" {
+			bad = d
+		}
+	}
+	if !bad.RolledBack {
+		t.Fatal("重启对账前的回退事实必须继续展示")
+	}
+}

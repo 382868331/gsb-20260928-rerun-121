@@ -85,6 +85,10 @@ curl -X POST localhost:8080/admin/v1/releases -d '{"content":{...}}'
   全部代次保留在规则历史中。
 - 操作者先 `plan` 预演：逐设备看到能否采用目标组合与**阻碍原因**，
   再选择一批设备 `release` 尝试。
+- 分批发布可在创建时给出多批设备与每批的组件确认条件；首批试运行满足
+  指定组件全部 `applied` 后，操作者必须显式确认才会推进下一批。
+- 每批独立保存设备范围、实际组合、等待组件、失败原因与已回退设备；
+  上一批完成不会代表后续批次完成。暂停期间当前批次可继续收尾，但不能准入下一批。
 - 组件级确认严格区分 `downloaded / validated / applied`：
   **单个组件下载成功不代表整组可用**；只有全部组件 `applied`
   （或重启后心跳自报组合已等于目标），设备才算完成。
@@ -96,8 +100,10 @@ curl -X POST localhost:8080/admin/v1/releases -d '{"content":{...}}'
   - 尚未开始的设备按新规则/版本清单**重新核对**，不满足则给出阻碍原因；
   - 部分应用的设备不清除进度，`waiting_on` 明确列出**等待哪项收尾**。
 - **回退**是选择一个仍然兼容的整组组合作为目标，而不是逐项恢复各自旧值；
-  含已撤回版本的回退组合会被拒绝。
-- 确认携带行动 ID，旧行动的**迟到确认**直接拒绝。
+  含已撤回版本的回退组合会被拒绝；也可使用 `only_failed` 只回退当前批次中的
+  失败设备，已采用新组合的其它设备继续服务。
+- 确认携带行动 ID 和批次号，旧行动或旧批次的**迟到确认**直接拒绝，
+  不能越过当前批次，也不能改变已回退事实。
 - 全部状态持久化到磁盘，重启后继续核对组合状态；
   **发布决定历史**与**后来的规则变化**分别可查
   （`/admin/v1/combo/decisions` 与 `/admin/v1/combo/rules/history`）。
@@ -123,8 +129,32 @@ go run ./cmd/combosim
 | GET | `/admin/v1/combo/rules/history` | 规则代次历史 |
 | POST | `/admin/v1/combo/plan` | 预演：逐设备可行性与阻碍原因 |
 | POST | `/admin/v1/combo/releases` | 选择一批设备尝试推进到目标组合 |
+| POST | `/admin/v1/combo/batches/advance` | 当前批满足条件后确认推进下一批 |
+| POST | `/admin/v1/combo/batches/pause` | 暂停后续批次准入 |
+| POST | `/admin/v1/combo/batches/resume` | 恢复后续批次准入 |
 | POST | `/admin/v1/combo/rollback` | 回退到仍兼容的整组组合 |
-| GET | `/admin/v1/combo/status` | 各设备实际组合、进度、等待项、阻碍原因 |
+| GET | `/admin/v1/combo/status` | 各设备与各批次实际组合、进度、等待项、失败原因、回退事实 |
 | GET | `/admin/v1/combo/decisions` | 发布/回退决定历史（只追加） |
 | POST | `/api/v1/combo/register` | 设备心跳：上报实际组合，取回目标 |
 | POST | `/api/v1/combo/ack` | 组件级确认：`downloaded/validated/applied/failed` |
+
+组合分批发布示例：
+
+```json
+{
+  "target": {"firmware": 3, "rf-driver": 2, "billing-app": 5},
+  "batches": [
+    {
+      "name": "试运行",
+      "device_ids": ["canary-1"],
+      "required_components": ["firmware", "rf-driver", "billing-app"]
+    },
+    {"name": "扩大批次", "device_ids": ["edge-1", "edge-2"]}
+  ]
+}
+```
+
+下一批不会自动开始：`/status` 中当前批的 `ready_to_advance=true` 后，操作者调用
+`/admin/v1/combo/batches/advance`。只回退失败设备时提交
+`{"campaign_id":1,"only_failed":true,"target":{...完整旧组合...}}`；
+未失败设备仍保留新组合并继续服务。

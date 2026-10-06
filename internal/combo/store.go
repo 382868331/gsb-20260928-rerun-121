@@ -77,6 +77,21 @@ func (s *Store) load() error {
 		s.devices = p.Devices
 	}
 	s.decisions = p.Decisions
+	for _, p := range s.plans {
+		if p.CampaignID == 0 {
+			for _, camp := range s.campaigns {
+				for _, id := range camp.DeviceIDs {
+					if id == p.DeviceID {
+						p.CampaignID = camp.ID
+						break
+					}
+				}
+				if p.CampaignID != 0 {
+					break
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -217,20 +232,152 @@ func (s *Store) checkLocked(target Combination) []string {
 // 已完成设备保留真实状态；未开始设备重新核对并记录阻碍原因；
 // 部分应用设备不清除进度，由 WaitingOn 明确等待的收尾组件。
 func (s *Store) reevaluateLocked() {
-	camp := s.activeCampaignLocked()
-	if camp == nil {
-		return
-	}
-	for _, id := range camp.DeviceIDs {
-		p := s.plans[id]
-		if p == nil || p.Done {
+	for _, camp := range s.campaigns {
+		if !camp.Active {
 			continue
 		}
-		if p.Started() {
-			continue // 部分应用：保留进度，等待收尾项
+		ids := camp.DeviceIDs
+		for _, batch := range camp.Batches {
+			if batch.Status == BatchActive {
+				ids = batch.DeviceIDs
+			}
 		}
-		p.Blocked = s.checkLocked(camp.Target)
+		for _, id := range ids {
+			p := s.findPlanLocked(camp.ID, id, camp.CurrentBatchNo)
+			if p == nil || p.Done || p.RolledBack {
+				continue
+			}
+			if p.Started() {
+				continue // 部分应用：保留进度，等待收尾项
+			}
+			p.Blocked = s.checkLocked(camp.Target)
+		}
 	}
+}
+
+func planKey(campaignID int, deviceID string, batchNo int) string {
+	return fmt.Sprintf("%d:%04d:%s", campaignID, batchNo, deviceID)
+}
+
+func (s *Store) planForCampaignLocked(camp *Campaign, deviceID string) *DevicePlan {
+	if camp == nil {
+		return nil
+	}
+	if len(camp.Batches) > 0 {
+		return s.findPlanLocked(camp.ID, deviceID, camp.CurrentBatchNo)
+	}
+	if p := s.plans[planKey(camp.ID, deviceID, 0)]; p != nil {
+		return p
+	}
+	return s.plans[deviceID]
+}
+
+func (s *Store) findPlanLocked(campaignID int, deviceID string, batchNo int) *DevicePlan {
+	if p := s.plans[planKey(campaignID, deviceID, batchNo)]; p != nil {
+		return p
+	}
+	if batchNo > 0 {
+		return s.plans[planKey(campaignID, deviceID, 0)]
+	}
+	return nil
+}
+
+func (s *Store) activePlanForDeviceLocked(deviceID string) *DevicePlan {
+	for i := len(s.campaigns) - 1; i >= 0; i-- {
+		camp := s.campaigns[i]
+		if !camp.Active {
+			continue
+		}
+		if p := s.planForCampaignLocked(&camp, deviceID); p != nil {
+			return p
+		}
+	}
+	return nil
+}
+
+func (s *Store) latestPlanForDeviceLocked(deviceID string) *DevicePlan {
+	for i := len(s.campaigns) - 1; i >= 0; i-- {
+		camp := s.campaigns[i]
+		if p := s.planForCampaignLocked(&camp, deviceID); p != nil {
+			return p
+		}
+	}
+	return nil
+}
+
+func (s *Store) makePlanLocked(camp *Campaign, id string, batchNo int) *DevicePlan {
+	d := s.devices[id]
+	components := map[string]*CompProgress{}
+	allApplied := true
+	for comp, ver := range camp.Target {
+		if d != nil && d.Current[comp] == ver {
+			components[comp] = &CompProgress{State: CompApplied}
+			continue
+		}
+		components[comp] = &CompProgress{State: CompPending}
+		allApplied = false
+	}
+	p := &DevicePlan{CampaignID: camp.ID, BatchNo: batchNo, DeviceID: id, Components: components}
+	if allApplied {
+		completedAt := camp.CreatedAt
+		p.Done = true
+		p.CompletedAt = &completedAt
+	}
+	s.plans[planKey(camp.ID, id, batchNo)] = p
+	return p
+}
+
+func failedComponents(p *DevicePlan) []string {
+	if p == nil {
+		return nil
+	}
+	var out []string
+	for name, cp := range p.Components {
+		if cp.State == CompFailed {
+			if cp.Error != "" {
+				out = append(out, name+": "+cp.Error)
+			} else {
+				out = append(out, name)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (s *Store) batchReadyLocked(camp *Campaign, batch BatchState) (bool, []string) {
+	required := batch.RequiredComponents
+	if len(required) == 0 {
+		required = componentNames(camp.Target)
+	}
+	var problems []string
+	for _, id := range batch.DeviceIDs {
+		p := s.findPlanLocked(camp.ID, id, batch.No)
+		if p == nil {
+			problems = append(problems, id+": 缺少确认记录")
+			continue
+		}
+		for _, comp := range required {
+			cp := p.Components[comp]
+			if cp == nil {
+				problems = append(problems, id+": 缺少组件 "+comp)
+				continue
+			}
+			if cp.State != CompApplied {
+				problems = append(problems, id+": "+comp+" 状态为 "+cp.State)
+			}
+		}
+	}
+	return len(problems) == 0, problems
+}
+
+func componentNames(target Combination) []string {
+	out := make([]string, 0, len(target))
+	for comp := range target {
+		out = append(out, comp)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ---- 预演与发布 ----
@@ -262,26 +409,37 @@ func (s *Store) Plan(target Combination) PlanResponse {
 
 // Release 选择一批设备尝试推进到目标组合（整组，不是逐组件独立推进）。
 func (s *Store) Release(req ReleaseRequest) (Decision, error) {
-	return s.startCampaign("release", req.Target, req.DeviceIDs)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(req.Target) == 0 {
+		return Decision{}, fmt.Errorf("目标组合不能为空")
+	}
+	if problems := s.checkLocked(req.Target); len(problems) > 0 {
+		return Decision{}, fmt.Errorf("目标组合不兼容: %v", problems)
+	}
+	if len(req.Batches) > 0 {
+		return s.startStagedReleaseLocked(req)
+	}
+	return s.startSimpleCampaignLocked("release", req.Target, req.DeviceIDs)
 }
 
 // Rollback 回退到一个仍然兼容的既有组合，而不是逐项恢复各自旧值。
 func (s *Store) Rollback(req RollbackRequest) (Decision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if len(req.Target) == 0 {
 		return Decision{}, fmt.Errorf("回退必须指定完整的目标组合")
 	}
-	return s.startCampaign("rollback", req.Target, req.DeviceIDs)
-}
-
-func (s *Store) startCampaign(kind string, target Combination, deviceIDs []string) (Decision, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(target) == 0 {
-		return Decision{}, fmt.Errorf("目标组合不能为空")
-	}
-	if problems := s.checkLocked(target); len(problems) > 0 {
+	if problems := s.checkLocked(req.Target); len(problems) > 0 {
 		return Decision{}, fmt.Errorf("目标组合不兼容: %v", problems)
 	}
+	if req.OnlyFailed {
+		return s.rollbackFailedLocked(req)
+	}
+	return s.startSimpleCampaignLocked("rollback", req.Target, req.DeviceIDs)
+}
+
+func (s *Store) startSimpleCampaignLocked(kind string, target Combination, deviceIDs []string) (Decision, error) {
 	if len(deviceIDs) == 0 {
 		deviceIDs = s.sortedDeviceIDsLocked()
 	}
@@ -315,15 +473,20 @@ func (s *Store) startCampaign(kind string, target Combination, deviceIDs []strin
 			dec.Rejected[id] = []string{"已处于目标组合"}
 			continue
 		}
-	accepted = append(accepted, id)
+		accepted = append(accepted, id)
 	}
 	if len(accepted) == 0 {
 		return Decision{}, fmt.Errorf("没有可推进的设备")
 	}
-	// 新行动取代旧行动；旧行动中未完成的设备保留真实状态，
-	// 是否继续由新行动的计划决定。
+	var parent *Campaign
 	for i := range s.campaigns {
-		s.campaigns[i].Active = false
+		c := &s.campaigns[i]
+		if c.Active && (kind == "rollback" || c.Kind == "release") {
+			parent = c
+			c.Active = false
+			c.Status = CampaignCompleted
+			break
+		}
 	}
 	camp := Campaign{
 		ID:         len(s.campaigns) + 1,
@@ -333,29 +496,14 @@ func (s *Store) startCampaign(kind string, target Combination, deviceIDs []strin
 		RulesetGen: dec.RulesetGen,
 		CreatedAt:  dec.At,
 		Active:     true,
+		Status:     CampaignActive,
+	}
+	if parent != nil {
+		camp.ParentCampaignID = parent.ID
 	}
 	s.campaigns = append(s.campaigns, camp)
 	for _, id := range accepted {
-		d := s.devices[id]
-		components := map[string]*CompProgress{}
-		allApplied := true
-		for comp, ver := range target {
-			// 新行动不擦掉已有事实：设备上已真实生效的版本
-			// 直接记为 applied，只等待确实需要变化的组件。
-			if d != nil && d.Current[comp] == ver {
-				components[comp] = &CompProgress{State: CompApplied}
-				continue
-			}
-			components[comp] = &CompProgress{State: CompPending}
-			allApplied = false
-		}
-		p := &DevicePlan{DeviceID: id, Components: components}
-		if allApplied {
-			completedAt := dec.At
-			p.Done = true
-			p.CompletedAt = &completedAt
-		}
-		s.plans[id] = p
+		s.makePlanLocked(&camp, id, 0)
 	}
 	dec.CampaignID = camp.ID
 	dec.Accepted = accepted
@@ -364,6 +512,228 @@ func (s *Store) startCampaign(kind string, target Combination, deviceIDs []strin
 		return Decision{}, err
 	}
 	return dec, nil
+}
+
+func (s *Store) startStagedReleaseLocked(req ReleaseRequest) (Decision, error) {
+	dec := Decision{
+		Seq:        len(s.decisions) + 1,
+		Kind:       "release",
+		Target:     req.Target.Clone(),
+		RulesetGen: s.rulesets[len(s.rulesets)-1].Generation,
+		At:         time.Now().UTC(),
+		Batches:    append([]BatchSpec(nil), req.Batches...),
+	}
+	seen := map[string]bool{}
+	camp := Campaign{
+		ID:             len(s.campaigns) + 1,
+		Kind:           "release",
+		Target:         req.Target.Clone(),
+		RulesetGen:     dec.RulesetGen,
+		CreatedAt:      dec.At,
+		Active:         true,
+		Status:         CampaignActive,
+		CurrentBatchNo: 1,
+	}
+	for i, spec := range req.Batches {
+		no := i + 1
+		batch := BatchState{No: no, Name: spec.Name, RequiredComponents: append([]string(nil), spec.RequiredComponents...), Status: BatchPending}
+		for _, id := range spec.DeviceIDs {
+			if seen[id] {
+				if dec.Rejected == nil {
+					dec.Rejected = map[string][]string{}
+				}
+				dec.Rejected[id] = []string{"设备重复出现在多个批次"}
+				continue
+			}
+			seen[id] = true
+			if _, ok := s.devices[id]; !ok {
+				if dec.Rejected == nil {
+					dec.Rejected = map[string][]string{}
+				}
+				dec.Rejected[id] = []string{"设备未注册"}
+				continue
+			}
+			batch.DeviceIDs = append(batch.DeviceIDs, id)
+			batch.OriginalDeviceIDs = append(batch.OriginalDeviceIDs, id)
+			camp.DeviceIDs = append(camp.DeviceIDs, id)
+			if no == 1 {
+				dec.Accepted = append(dec.Accepted, id)
+			}
+		}
+		camp.Batches = append(camp.Batches, batch)
+	}
+	if len(camp.Batches) == 0 || len(camp.Batches[0].DeviceIDs) == 0 {
+		return Decision{}, fmt.Errorf("首批至少需要一台已注册设备")
+	}
+	for i := range s.campaigns {
+		if s.campaigns[i].Active && s.campaigns[i].Kind == "release" {
+			s.campaigns[i].Active = false
+			s.campaigns[i].Status = CampaignCompleted
+		}
+	}
+	camp.Batches[0].Status = BatchActive
+	for _, id := range camp.Batches[0].DeviceIDs {
+		s.makePlanLocked(&camp, id, 1)
+	}
+	s.campaigns = append(s.campaigns, camp)
+	dec.CampaignID = camp.ID
+	s.decisions = append(s.decisions, dec)
+	if err := s.persistLocked(); err != nil {
+		return Decision{}, err
+	}
+	return dec, nil
+}
+
+func (s *Store) PauseCampaign(id int) (Decision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	camp := s.campaignByIDLocked(id)
+	if camp == nil || !camp.Active || camp.Kind != "release" || len(camp.Batches) == 0 {
+		return Decision{}, fmt.Errorf("没有可暂停的分批发布行动")
+	}
+	camp.Paused = true
+	dec := s.addDecisionLocked("batch_pause", camp, nil, camp.CurrentBatchNo)
+	return dec, s.persistLocked()
+}
+
+func (s *Store) ResumeCampaign(id int) (Decision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	camp := s.campaignByIDLocked(id)
+	if camp == nil || !camp.Active || camp.Kind != "release" || len(camp.Batches) == 0 {
+		return Decision{}, fmt.Errorf("没有可恢复的分批发布行动")
+	}
+	camp.Paused = false
+	dec := s.addDecisionLocked("batch_resume", camp, nil, camp.CurrentBatchNo)
+	return dec, s.persistLocked()
+}
+
+func (s *Store) AdvanceBatch(req BatchAdvanceRequest) (Decision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	camp := s.activeStagedCampaignLocked(req.CampaignID)
+	if camp == nil {
+		return Decision{}, fmt.Errorf("没有可推进的分批发布行动")
+	}
+	if camp.Paused {
+		return Decision{}, fmt.Errorf("发布已暂停，不能推进下一批")
+	}
+	current := &camp.Batches[camp.CurrentBatchNo-1]
+	ready, problems := s.batchReadyLocked(camp, *current)
+	if !ready {
+		return Decision{}, fmt.Errorf("当前批次尚未满足组件确认条件: %v", problems)
+	}
+	if camp.CurrentBatchNo >= len(camp.Batches) {
+		return Decision{}, fmt.Errorf("已经是最后一批")
+	}
+	current.Status = BatchCompleted
+	camp.CurrentBatchNo++
+	next := &camp.Batches[camp.CurrentBatchNo-1]
+	next.Status = BatchActive
+	var accepted []string
+	for _, id := range next.DeviceIDs {
+		s.makePlanLocked(camp, id, next.No)
+		accepted = append(accepted, id)
+	}
+	dec := s.addDecisionLocked("batch_advance", camp, accepted, next.No)
+	return dec, s.persistLocked()
+}
+
+func (s *Store) rollbackFailedLocked(req RollbackRequest) (Decision, error) {
+	camp := s.campaignByIDLocked(req.CampaignID)
+	if camp == nil || !camp.Active || camp.Kind != "release" {
+		return Decision{}, fmt.Errorf("only_failed 回退必须指定进行中的发布行动")
+	}
+	candidates := append([]string(nil), req.DeviceIDs...)
+	if len(candidates) == 0 {
+		if len(camp.Batches) > 0 {
+			candidates = camp.Batches[camp.CurrentBatchNo-1].DeviceIDs
+		} else {
+			candidates = camp.DeviceIDs
+		}
+	}
+	var failed []string
+	rejected := map[string][]string{}
+	for _, id := range candidates {
+		p := s.planForCampaignLocked(camp, id)
+		if p == nil {
+			rejected[id] = []string{"设备不在当前批次"}
+			continue
+		}
+		if reasons := failedComponents(p); len(reasons) > 0 {
+			failed = append(failed, id)
+		} else {
+			rejected[id] = []string{"设备没有失败组件，继续保持新组合服务"}
+		}
+	}
+	if len(failed) == 0 {
+		return Decision{}, fmt.Errorf("没有需要回退的失败设备")
+	}
+	rb := Campaign{
+		ID:               len(s.campaigns) + 1,
+		Kind:             "rollback",
+		Target:           req.Target.Clone(),
+		DeviceIDs:        append([]string(nil), failed...),
+		RulesetGen:       s.rulesets[len(s.rulesets)-1].Generation,
+		CreatedAt:        time.Now().UTC(),
+		Active:           true,
+		Status:           CampaignActive,
+		ParentCampaignID: camp.ID,
+	}
+	for _, id := range failed {
+		s.makePlanLocked(&rb, id, 0)
+		p := s.plans[planKey(rb.ID, id, 0)]
+		p.BatchNo = 0
+		s.markDeviceRolledBackLocked(camp, id)
+	}
+	s.campaigns = append(s.campaigns, rb)
+	dec := Decision{
+		Seq:        len(s.decisions) + 1,
+		Kind:       "rollback",
+		CampaignID: rb.ID,
+		Target:     req.Target.Clone(),
+		RulesetGen: rb.RulesetGen,
+		Accepted:   failed,
+		Rejected:   rejected,
+		At:         rb.CreatedAt,
+	}
+	s.decisions = append(s.decisions, dec)
+	return dec, s.persistLocked()
+}
+
+func (s *Store) campaignByIDLocked(id int) *Campaign {
+	if id == 0 {
+		return s.activeCampaignLocked()
+	}
+	for i := range s.campaigns {
+		if s.campaigns[i].ID == id {
+			return &s.campaigns[i]
+		}
+	}
+	return nil
+}
+
+func (s *Store) activeStagedCampaignLocked(id int) *Campaign {
+	camp := s.campaignByIDLocked(id)
+	if camp != nil && camp.Active && camp.Kind == "release" && len(camp.Batches) > 0 {
+		return camp
+	}
+	return nil
+}
+
+func (s *Store) addDecisionLocked(kind string, camp *Campaign, accepted []string, batchNo int) Decision {
+	dec := Decision{
+		Seq:        len(s.decisions) + 1,
+		Kind:       kind,
+		CampaignID: camp.ID,
+		Target:     camp.Target.Clone(),
+		RulesetGen: camp.RulesetGen,
+		Accepted:   append([]string(nil), accepted...),
+		BatchNo:    batchNo,
+		At:         time.Now().UTC(),
+	}
+	s.decisions = append(s.decisions, dec)
+	return dec
 }
 
 // ---- 设备侧 ----
@@ -384,12 +754,12 @@ func (s *Store) Register(req RegisterRequest) (RegisterResponse, error) {
 	d.Current = req.Current.Clone()
 	d.LastSeen = &now
 
-	camp := s.activeCampaignLocked()
-	if camp == nil {
+	p := s.activePlanForDeviceLocked(req.DeviceID)
+	if p == nil {
 		return RegisterResponse{}, s.persistLocked()
 	}
-	p := s.plans[req.DeviceID]
-	if p == nil {
+	camp := s.campaignByIDLocked(p.CampaignID)
+	if camp == nil || !camp.Active {
 		return RegisterResponse{}, s.persistLocked()
 	}
 	if d.Current.Equal(camp.Target) {
@@ -400,6 +770,7 @@ func (s *Store) Register(req RegisterRequest) (RegisterResponse, error) {
 			for _, cp := range p.Components {
 				cp.State = CompApplied
 			}
+			s.afterDeviceCompletedLocked(camp, req.DeviceID)
 		}
 		return RegisterResponse{}, s.persistLocked()
 	}
@@ -416,22 +787,25 @@ func (s *Store) Register(req RegisterRequest) (RegisterResponse, error) {
 func (s *Store) Ack(req AckRequest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	camp := s.activeCampaignLocked()
-	if camp == nil {
+	camp := s.campaignByIDLocked(req.CampaignID)
+	if camp == nil || !camp.Active {
 		return fmt.Errorf("当前没有进行中的行动，确认已迟到")
 	}
-	if req.CampaignID != camp.ID {
-		return fmt.Errorf("迟到确认：行动 %d 已结束，当前行动为 %d", req.CampaignID, camp.ID)
-	}
-	p := s.plans[req.DeviceID]
+	p := s.planForCampaignLocked(camp, req.DeviceID)
 	if p == nil {
-		return fmt.Errorf("设备 %s 不在当前行动中", req.DeviceID)
+		return fmt.Errorf("设备 %s 不在行动 %d 的当前批次中", req.DeviceID, camp.ID)
+	}
+	if req.BatchNo != 0 && req.BatchNo != p.BatchNo {
+		return fmt.Errorf("迟到确认：行动 %d 当前批次为 %d，收到批次 %d", camp.ID, p.BatchNo, req.BatchNo)
 	}
 	if p.Done {
 		return fmt.Errorf("设备 %s 已完成当前行动", req.DeviceID)
 	}
 	if len(p.Blocked) > 0 {
 		return fmt.Errorf("设备 %s 被阻碍: %v", req.DeviceID, p.Blocked)
+	}
+	if p.RolledBack {
+		return fmt.Errorf("设备 %s 已从原行动回退，迟到确认不得改变回退事实", req.DeviceID)
 	}
 	cp, ok := p.Components[req.Component]
 	if !ok {
@@ -480,8 +854,62 @@ func (s *Store) Ack(req AckRequest) error {
 		if d := s.devices[req.DeviceID]; d != nil {
 			d.Current = camp.Target.Clone()
 		}
+		s.afterDeviceCompletedLocked(camp, req.DeviceID)
 	}
 	return s.persistLocked()
+}
+
+func (s *Store) completeCampaignIfReadyLocked(camp *Campaign) {
+	if camp == nil || !camp.Active || (len(camp.Batches) > 0 && camp.CurrentBatchNo != len(camp.Batches)) {
+		return
+	}
+	ids := camp.DeviceIDs
+	if len(camp.Batches) > 0 && camp.CurrentBatchNo > 0 {
+		ids = camp.Batches[camp.CurrentBatchNo-1].DeviceIDs
+	}
+	for _, id := range ids {
+		p := s.findPlanLocked(camp.ID, id, camp.CurrentBatchNo)
+		if p == nil || !p.Done {
+			return
+		}
+	}
+	camp.Active = false
+	camp.Status = CampaignCompleted
+}
+
+func (s *Store) afterDeviceCompletedLocked(camp *Campaign, deviceID string) {
+	if camp.Kind == "rollback" && camp.ParentCampaignID != 0 {
+		if parent := s.campaignByIDLocked(camp.ParentCampaignID); parent != nil && parent.Active {
+			s.markDeviceRolledBackLocked(parent, deviceID)
+		}
+	}
+	s.completeCampaignIfReadyLocked(camp)
+}
+
+func (s *Store) markDeviceRolledBackLocked(parent *Campaign, deviceID string) {
+	if len(parent.Batches) > 0 {
+		batch := &parent.Batches[parent.CurrentBatchNo-1]
+		batch.DeviceIDs = removeString(batch.DeviceIDs, deviceID)
+		batch.RolledBackDeviceIDs = append(batch.RolledBackDeviceIDs, deviceID)
+	}
+	for batchNo := range parent.Batches {
+		if p := s.findPlanLocked(parent.ID, deviceID, batchNo+1); p != nil {
+			p.RolledBack = true
+		}
+	}
+	if p := s.plans[planKey(parent.ID, deviceID, 0)]; p != nil {
+		p.RolledBack = true
+	}
+}
+
+func removeString(items []string, want string) []string {
+	out := items[:0]
+	for _, item := range items {
+		if item != want {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 // ---- 状态视图 ----
@@ -495,9 +923,16 @@ func (s *Store) Snapshot(online func(id string) bool) StatusResponse {
 		Rules:      append([]Rule(nil), s.rulesets[len(s.rulesets)-1].Rules...),
 	}
 	camp := s.activeCampaignLocked()
+	if camp == nil {
+		camp = s.primaryCompletedCampaignLocked()
+	}
 	if camp != nil {
 		c := *camp
 		resp.Campaign = &c
+	}
+	for i := range s.campaigns {
+		c := s.campaigns[i]
+		resp.Campaigns = append(resp.Campaigns, c)
 	}
 	for _, id := range s.sortedDeviceIDsLocked() {
 		d := s.devices[id]
@@ -509,13 +944,24 @@ func (s *Store) Snapshot(online func(id string) bool) StatusResponse {
 		if online != nil {
 			v.Online = online(id)
 		}
-		if camp != nil {
-			if p := s.plans[id]; p != nil {
+		p := s.latestPlanForDeviceLocked(id)
+		if p != nil {
+			pcamp := s.campaignByIDLocked(p.CampaignID)
+			if pcamp != nil {
 				v.InCampaign = true
-				v.Target = camp.Target.Clone()
+				v.CampaignID = pcamp.ID
+				v.BatchNo = p.BatchNo
+				v.Target = pcamp.Target.Clone()
 				v.Components = p.Components
 				v.Blocked = p.Blocked
 				v.Done = p.Done
+				v.RolledBack = p.RolledBack
+				v.Failed = failedComponents(p)
+				if p.BatchNo > 0 {
+					batch := &pcamp.Batches[p.BatchNo-1]
+					v.BatchName = batch.Name
+					v.BatchStatus = batch.Status
+				}
 				if !p.Done && len(p.Blocked) == 0 {
 					v.WaitingOn = p.WaitingOn()
 				}
@@ -523,12 +969,68 @@ func (s *Store) Snapshot(online func(id string) bool) StatusResponse {
 		}
 		resp.Devices = append(resp.Devices, v)
 	}
+	if camp != nil && len(camp.Batches) > 0 {
+		for i := range camp.Batches {
+			batch := camp.Batches[i]
+			bv := BatchView{
+				No:                  batch.No,
+				Name:                batch.Name,
+				Status:              batch.Status,
+				RequiredComponents:  append([]string(nil), batch.RequiredComponents...),
+				DeviceIDs:           append([]string(nil), batch.DeviceIDs...),
+				RolledBackDeviceIDs: append([]string(nil), batch.RolledBackDeviceIDs...),
+			}
+			if batch.Status == BatchActive && !camp.Paused {
+				bv.ReadyToAdvance, _ = s.batchReadyLocked(camp, batch)
+			}
+			for _, id := range batch.OriginalDeviceIDs {
+				d := s.devices[id]
+				dv := DeviceView{DeviceID: id, Current: d.Current.Clone()}
+				if online != nil {
+					dv.Online = online(id)
+				}
+				p := s.findPlanLocked(camp.ID, id, batch.No)
+				if p != nil {
+					dv.CampaignID = camp.ID
+					dv.BatchNo = batch.No
+					dv.BatchName = batch.Name
+					dv.BatchStatus = batch.Status
+					dv.Target = camp.Target.Clone()
+					dv.Components = p.Components
+					dv.Blocked = p.Blocked
+					dv.Done = p.Done
+					dv.RolledBack = p.RolledBack
+					dv.Failed = failedComponents(p)
+					if !p.Done && len(p.Blocked) == 0 && !p.RolledBack {
+						dv.WaitingOn = p.WaitingOn()
+					}
+				}
+				bv.Devices = append(bv.Devices, dv)
+			}
+			resp.Batches = append(resp.Batches, bv)
+		}
+	}
 	return resp
 }
 
 func (s *Store) activeCampaignLocked() *Campaign {
+	var first *Campaign
 	for i := range s.campaigns {
 		if s.campaigns[i].Active {
+			if first == nil {
+				first = &s.campaigns[i]
+			}
+			if s.campaigns[i].Kind != "rollback" {
+				return &s.campaigns[i]
+			}
+		}
+	}
+	return first
+}
+
+func (s *Store) primaryCompletedCampaignLocked() *Campaign {
+	for i := len(s.campaigns) - 1; i >= 0; i-- {
+		if s.campaigns[i].Kind != "rollback" {
 			return &s.campaigns[i]
 		}
 	}

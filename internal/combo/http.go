@@ -38,12 +38,56 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/admin/v1/combo/rules/history", s.handleRulesHistory)
 	mux.HandleFunc("/admin/v1/combo/plan", s.handlePlan)
 	mux.HandleFunc("/admin/v1/combo/releases", s.handleRelease)
+	mux.HandleFunc("/admin/v1/combo/batches/advance", s.handleBatchAdvance)
+	mux.HandleFunc("/admin/v1/combo/batches/pause", s.handlePause)
+	mux.HandleFunc("/admin/v1/combo/batches/resume", s.handleResume)
 	mux.HandleFunc("/admin/v1/combo/rollback", s.handleRollback)
 	mux.HandleFunc("/admin/v1/combo/status", s.handleStatus)
 	mux.HandleFunc("/admin/v1/combo/decisions", s.handleDecisions)
 	mux.HandleFunc("/api/v1/combo/register", s.handleRegister)
 	mux.HandleFunc("/api/v1/combo/ack", s.handleAck)
 	return mux
+}
+
+func (s *Server) handleBatchAdvance(w http.ResponseWriter, r *http.Request) {
+	var req BatchAdvanceRequest
+	if r.Body != nil && r.ContentLength != 0 {
+		if !decode(w, r, &req) {
+			return
+		}
+	}
+	dec, err := s.store.AdvanceBatch(req)
+	if err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, dec)
+}
+
+func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
+	var req BatchAdvanceRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	dec, err := s.store.PauseCampaign(req.CampaignID)
+	if err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, dec)
+}
+
+func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
+	var req BatchAdvanceRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	dec, err := s.store.ResumeCampaign(req.CampaignID)
+	if err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, dec)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {

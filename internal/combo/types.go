@@ -24,6 +24,16 @@ const (
 	CompFailed     = "failed"
 )
 
+// 批次与行动状态。
+const (
+	BatchPending   = "pending"
+	BatchActive    = "active"
+	BatchCompleted = "completed"
+
+	CampaignActive    = "active"
+	CampaignCompleted = "completed"
+)
+
 // Combination 是设备上一组组件版本的组合，例如
 // {"firmware": 3, "rf-driver": 2, "billing-app": 5}。
 type Combination map[string]int
@@ -109,13 +119,34 @@ type Ruleset struct {
 
 // Campaign 是一次针对“整组组合”的发布/回退行动。
 type Campaign struct {
-	ID         int         `json:"id"`
-	Kind       string      `json:"kind"` // release | rollback
-	Target     Combination `json:"target"`
-	DeviceIDs  []string    `json:"device_ids"`
-	RulesetGen int         `json:"ruleset_gen"` // 决策时使用的约束代次
-	CreatedAt  time.Time   `json:"created_at"`
-	Active     bool        `json:"active"`
+	ID               int          `json:"id"`
+	Kind             string       `json:"kind"` // release | rollback | batch_advance | batch_pause | batch_resume
+	Target           Combination  `json:"target"`
+	DeviceIDs        []string     `json:"device_ids"`
+	RulesetGen       int          `json:"ruleset_gen"` // 决策时使用的约束代次
+	CreatedAt        time.Time    `json:"created_at"`
+	Active           bool         `json:"active"`
+	Status           string       `json:"status,omitempty"`
+	Paused           bool         `json:"paused,omitempty"`
+	CurrentBatchNo   int          `json:"current_batch_no,omitempty"`
+	Batches          []BatchState `json:"batches,omitempty"`
+	ParentCampaignID int          `json:"parent_campaign_id,omitempty"`
+}
+
+type BatchSpec struct {
+	Name               string   `json:"name,omitempty"`
+	DeviceIDs          []string `json:"device_ids"`
+	RequiredComponents []string `json:"required_components,omitempty"`
+}
+
+type BatchState struct {
+	No                  int      `json:"no"`
+	Name                string   `json:"name,omitempty"`
+	DeviceIDs           []string `json:"device_ids"`
+	OriginalDeviceIDs   []string `json:"original_device_ids,omitempty"`
+	RequiredComponents  []string `json:"required_components,omitempty"`
+	Status              string   `json:"status"`
+	RolledBackDeviceIDs []string `json:"rolled_back_device_ids,omitempty"`
 }
 
 // CompProgress 记录设备上单个组件的推进状态。
@@ -126,10 +157,13 @@ type CompProgress struct {
 
 // DevicePlan 是某台设备在当前行动中的推进计划与真实进度。
 type DevicePlan struct {
+	CampaignID  int                      `json:"campaign_id,omitempty"`
+	BatchNo     int                      `json:"batch_no,omitempty"`
 	DeviceID    string                   `json:"device_id"`
 	Components  map[string]*CompProgress `json:"components"`
 	Blocked     []string                 `json:"blocked,omitempty"` // 重新核对后的阻碍原因
 	Done        bool                     `json:"done"`
+	RolledBack  bool                     `json:"rolled_back,omitempty"`
 	CompletedAt *time.Time               `json:"completed_at,omitempty"`
 }
 
@@ -165,6 +199,8 @@ type Decision struct {
 	RulesetGen int                 `json:"ruleset_gen"`
 	Accepted   []string            `json:"accepted"`
 	Rejected   map[string][]string `json:"rejected,omitempty"` // 设备 -> 阻碍原因
+	BatchNo    int                 `json:"batch_no,omitempty"`
+	Batches    []BatchSpec         `json:"batches,omitempty"`
 	At         time.Time           `json:"at"`
 }
 
@@ -199,11 +235,18 @@ type PlanResponse struct {
 type ReleaseRequest struct {
 	Target    Combination `json:"target"`
 	DeviceIDs []string    `json:"device_ids"`
+	Batches   []BatchSpec `json:"batches,omitempty"`
 }
 
 type RollbackRequest struct {
-	Target    Combination `json:"target"`
-	DeviceIDs []string    `json:"device_ids,omitempty"`
+	Target     Combination `json:"target"`
+	DeviceIDs  []string    `json:"device_ids,omitempty"`
+	OnlyFailed bool        `json:"only_failed,omitempty"`
+	CampaignID int         `json:"campaign_id,omitempty"`
+}
+
+type BatchAdvanceRequest struct {
+	CampaignID int `json:"campaign_id,omitempty"`
 }
 
 type RegisterRequest struct {
@@ -220,22 +263,40 @@ type RegisterResponse struct {
 type AckRequest struct {
 	DeviceID   string `json:"device_id"`
 	CampaignID int    `json:"campaign_id"`
+	BatchNo    int    `json:"batch_no,omitempty"`
 	Component  string `json:"component"`
 	Kind       string `json:"kind"` // downloaded | validated | applied | failed
 	Reason     string `json:"reason,omitempty"`
 }
 
 type DeviceView struct {
-	DeviceID   string                   `json:"device_id"`
-	Current    Combination              `json:"current"`
-	Online     bool                     `json:"online"`
-	LastSeen   *time.Time               `json:"last_seen,omitempty"`
-	InCampaign bool                     `json:"in_campaign"`
-	Target     Combination              `json:"target,omitempty"`
-	Components map[string]*CompProgress `json:"components,omitempty"`
-	WaitingOn  []string                 `json:"waiting_on,omitempty"`
-	Blocked    []string                 `json:"blocked,omitempty"`
-	Done       bool                     `json:"done"`
+	CampaignID  int                      `json:"campaign_id,omitempty"`
+	BatchNo     int                      `json:"batch_no,omitempty"`
+	BatchName   string                   `json:"batch_name,omitempty"`
+	BatchStatus string                   `json:"batch_status,omitempty"`
+	DeviceID    string                   `json:"device_id"`
+	Current     Combination              `json:"current"`
+	Online      bool                     `json:"online"`
+	LastSeen    *time.Time               `json:"last_seen,omitempty"`
+	InCampaign  bool                     `json:"in_campaign"`
+	Target      Combination              `json:"target,omitempty"`
+	Components  map[string]*CompProgress `json:"components,omitempty"`
+	WaitingOn   []string                 `json:"waiting_on,omitempty"`
+	Blocked     []string                 `json:"blocked,omitempty"`
+	Failed      []string                 `json:"failed,omitempty"`
+	RolledBack  bool                     `json:"rolled_back,omitempty"`
+	Done        bool                     `json:"done"`
+}
+
+type BatchView struct {
+	No                  int          `json:"no"`
+	Name                string       `json:"name,omitempty"`
+	Status              string       `json:"status"`
+	RequiredComponents  []string     `json:"required_components,omitempty"`
+	ReadyToAdvance      bool         `json:"ready_to_advance"`
+	DeviceIDs           []string     `json:"device_ids"`
+	RolledBackDeviceIDs []string     `json:"rolled_back_device_ids,omitempty"`
+	Devices             []DeviceView `json:"devices"`
 }
 
 type StatusResponse struct {
@@ -243,5 +304,7 @@ type StatusResponse struct {
 	RulesetGen int                `json:"ruleset_gen"`
 	Rules      []Rule             `json:"rules"`
 	Campaign   *Campaign          `json:"campaign,omitempty"`
+	Campaigns  []Campaign         `json:"campaigns,omitempty"`
+	Batches    []BatchView        `json:"batches,omitempty"`
 	Devices    []DeviceView       `json:"devices"`
 }
